@@ -1,24 +1,26 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::cmp::max;
 
 const MIN_BC_CACHE_MB: u32 = 4;
-const MIN_DB_CACHE_MB: u32 = 2;
+const MIN_DB_CACHE_MB: u32 = 8;
 const MIN_BLOCK_QUEUE_SIZE_LIMIT_MB: u32 = 16;
+const DEFAULT_DB_CACHE_SIZE: u32 = 128;
+const DEFAULT_BC_CACHE_SIZE: u32 = 8;
 const DEFAULT_BLOCK_QUEUE_SIZE_LIMIT_MB: u32 = 40;
 const DEFAULT_TRACE_CACHE_SIZE: u32 = 20;
 const DEFAULT_STATE_CACHE_SIZE: u32 = 25;
@@ -41,12 +43,18 @@ pub struct CacheConfig {
 
 impl Default for CacheConfig {
 	fn default() -> Self {
-		CacheConfig::new(32, 8, DEFAULT_BLOCK_QUEUE_SIZE_LIMIT_MB, DEFAULT_STATE_CACHE_SIZE)
+		CacheConfig::new(
+			DEFAULT_DB_CACHE_SIZE,
+			DEFAULT_BC_CACHE_SIZE,
+			DEFAULT_BLOCK_QUEUE_SIZE_LIMIT_MB,
+			DEFAULT_STATE_CACHE_SIZE)
 	}
 }
 
 impl CacheConfig {
-	/// Creates new cache config with cumulative size equal `total`.
+	/// Creates new cache config with cumulative size equal to `total`, distributed as follows: 70%
+	/// to rocksdb, 10% to the blockchain cache and 20% to the state cache. The transaction queue
+	/// cache size is set to 40Mb and the trace cache to 20Mb.
 	pub fn new_with_total_cache_size(total: u32) -> Self {
 		CacheConfig {
 			db: total * 7 / 10,
@@ -57,25 +65,20 @@ impl CacheConfig {
 		}
 	}
 
-	/// Creates new cache config with gitven details.
+	/// Creates new cache config with given details.
 	pub fn new(db: u32, blockchain: u32, queue: u32, state: u32) -> Self {
 		CacheConfig {
-			db: db,
-			blockchain: blockchain,
-			queue: queue,
+			db,
+			blockchain,
+			queue,
 			traces: DEFAULT_TRACE_CACHE_SIZE,
-			state: state,
+			state,
 		}
 	}
 
-	/// Size of db cache for blockchain.
-	pub fn db_blockchain_cache_size(&self) -> u32 {
-		max(MIN_DB_CACHE_MB, self.db / 4)
-	}
-
-	/// Size of db cache for state.
-	pub fn db_state_cache_size(&self) -> u32 {
-		max(MIN_DB_CACHE_MB, self.db * 3 / 4)
+	/// Size of db cache.
+	pub fn db_cache_size(&self) -> u32 {
+		max(MIN_DB_CACHE_MB, self.db)
 	}
 
 	/// Size of block queue size limit
@@ -122,13 +125,16 @@ mod tests {
 	fn test_cache_config_db_cache_sizes() {
 		let config = CacheConfig::new_with_total_cache_size(400);
 		assert_eq!(config.db, 280);
-		assert_eq!(config.db_blockchain_cache_size(), 70);
-		assert_eq!(config.db_state_cache_size(), 210);
+		assert_eq!(config.db_cache_size(), 280);
 	}
 
 	#[test]
 	fn test_cache_config_default() {
 		assert_eq!(CacheConfig::default(),
-			CacheConfig::new(32, 8, super::DEFAULT_BLOCK_QUEUE_SIZE_LIMIT_MB, super::DEFAULT_STATE_CACHE_SIZE));
+				   CacheConfig::new(
+					   super::DEFAULT_DB_CACHE_SIZE,
+					   super::DEFAULT_BC_CACHE_SIZE,
+					   super::DEFAULT_BLOCK_QUEUE_SIZE_LIMIT_MB,
+					   super::DEFAULT_STATE_CACHE_SIZE));
 	}
 }

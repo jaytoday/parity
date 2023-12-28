@@ -1,47 +1,43 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! PLP Protocol Version 1 implementation.
 //!
 //! This uses a "Provider" to answer requests.
 
-use ethcore::transaction::UnverifiedTransaction;
-
+use common_types::transaction::UnverifiedTransaction;
+use ethereum_types::{H256, U256};
 use io::TimerToken;
-use network::{HostInfo, NetworkProtocolHandler, NetworkContext, PeerId};
-use rlp::{RlpStream, UntrustedRlp};
-use bigint::prelude::U256;
-use bigint::hash::H256;
-use util::DBValue;
+use kvdb::DBValue;
+use network::{NetworkProtocolHandler, NetworkContext, PeerId};
 use parking_lot::{Mutex, RwLock};
-use time::{Duration, SteadyTime};
-
-use std::collections::{HashMap, HashSet};
-use std::fmt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::ops::{BitOr, BitAnd, Not};
-
 use provider::Provider;
 use request::{Request, NetworkRequests as Requests, Response};
+use rlp::{RlpStream, Rlp};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
+use std::ops::{BitOr, BitAnd, Not};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use self::request_credits::{Credits, FlowParams};
 use self::context::{Ctx, TickCtx};
 use self::error::Punishment;
-use self::load_timer::{LoadDistribution, NullStore};
+use self::load_timer::{LoadDistribution, NullStore, MOVING_SAMPLE_SIZE};
 use self::request_set::RequestSet;
 use self::id_guard::IdGuard;
 
@@ -62,28 +58,40 @@ pub use self::load_timer::{SampleStore, FileStore};
 pub use self::status::{Status, Capabilities, Announcement};
 
 const TIMEOUT: TimerToken = 0;
-const TIMEOUT_INTERVAL_MS: u64 = 1000;
+const TIMEOUT_INTERVAL: Duration = Duration::from_secs(1);
 
 const TICK_TIMEOUT: TimerToken = 1;
-const TICK_TIMEOUT_INTERVAL_MS: u64 = 5000;
+const TICK_TIMEOUT_INTERVAL: Duration = Duration::from_secs(5);
 
 const PROPAGATE_TIMEOUT: TimerToken = 2;
-const PROPAGATE_TIMEOUT_INTERVAL_MS: u64 = 5000;
+const PROPAGATE_TIMEOUT_INTERVAL: Duration = Duration::from_secs(5);
 
 const RECALCULATE_COSTS_TIMEOUT: TimerToken = 3;
-const RECALCULATE_COSTS_INTERVAL_MS: u64 = 60 * 60 * 1000;
+const RECALCULATE_COSTS_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+const STATISTICS_TIMEOUT: TimerToken = 4;
+const STATISTICS_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Maximum load share for the light server
+pub const MAX_LIGHTSERV_LOAD: f64 = 0.5;
+
+/// Factor to multiply leecher count to cater for
+/// extra sudden connections (should be >= 1.0)
+pub const LEECHER_COUNT_FACTOR: f64 = 1.25;
 
 // minimum interval between updates.
-const UPDATE_INTERVAL_MS: i64 = 5000;
+const UPDATE_INTERVAL: Duration = Duration::from_millis(5000);
+
+/// Packet count for PIP.
+const PACKET_COUNT_V1: u8 = 9;
 
 /// Supported protocol versions.
-pub const PROTOCOL_VERSIONS: &'static [u8] = &[1];
+pub const PROTOCOL_VERSIONS: &[(u8, u8)] = &[
+	(1, PACKET_COUNT_V1),
+];
 
 /// Max protocol version.
 pub const MAX_PROTOCOL_VERSION: u8 = 1;
-
-/// Packet count for PIP.
-pub const PACKET_COUNT: u8 = 9;
 
 // packet ID definitions.
 mod packet {
@@ -110,20 +118,22 @@ mod packet {
 
 // timeouts for different kinds of requests. all values are in milliseconds.
 mod timeout {
-	pub const HANDSHAKE: i64 = 2500;
-	pub const ACKNOWLEDGE_UPDATE: i64 = 5000;
-	pub const BASE: i64 = 1500; // base timeout for packet.
+	use std::time::Duration;
+
+	pub const HANDSHAKE: Duration = Duration::from_millis(4_000);
+	pub const ACKNOWLEDGE_UPDATE: Duration = Duration::from_millis(5_000);
+	pub const BASE: u64 = 2_500; // base timeout for packet.
 
 	// timeouts per request within packet.
-	pub const HEADERS: i64 = 250; // per header?
-	pub const TRANSACTION_INDEX: i64 = 100;
-	pub const BODY: i64 = 50;
-	pub const RECEIPT: i64 = 50;
-	pub const PROOF: i64 = 100; // state proof
-	pub const CONTRACT_CODE: i64 = 100;
-	pub const HEADER_PROOF: i64 = 100;
-	pub const TRANSACTION_PROOF: i64 = 1000; // per gas?
-	pub const EPOCH_SIGNAL: i64 = 200;
+	pub const HEADERS: u64 = 250; // per header?
+	pub const TRANSACTION_INDEX: u64 = 100;
+	pub const BODY: u64 = 50;
+	pub const RECEIPT: u64 = 50;
+	pub const PROOF: u64 = 100; // state proof
+	pub const CONTRACT_CODE: u64 = 100;
+	pub const HEADER_PROOF: u64 = 100;
+	pub const TRANSACTION_PROOF: u64 = 1000; // per gas?
+	pub const EPOCH_SIGNAL: u64 = 200;
 }
 
 /// A request id.
@@ -145,7 +155,7 @@ impl fmt::Display for ReqId {
 // may not have received one for.
 struct PendingPeer {
 	sent_head: H256,
-	last_update: SteadyTime,
+	last_update: Instant,
 }
 
 /// Relevant data to each peer. Not accessible publicly, only `pub` due to
@@ -156,13 +166,13 @@ pub struct Peer {
 	capabilities: Capabilities,
 	remote_flow: Option<(Credits, FlowParams)>,
 	sent_head: H256, // last chain head we've given them.
-	last_update: SteadyTime,
+	last_update: Instant,
 	pending_requests: RequestSet,
 	failed_requests: Vec<ReqId>,
 	propagated_transactions: HashSet<H256>,
 	skip_update: bool,
 	local_flow: Arc<FlowParams>,
-	awaiting_acknowledge: Option<(SteadyTime, Arc<FlowParams>)>,
+	awaiting_acknowledge: Option<(Instant, Arc<FlowParams>)>,
 }
 
 /// Whether or not a peer was kept by a handler
@@ -226,25 +236,25 @@ pub trait Handler: Send + Sync {
 	/// Called when a peer connects.
 	fn on_connect(
 		&self,
-		_ctx: &EventContext,
+		_ctx: &dyn EventContext,
 		_status: &Status,
 		_capabilities: &Capabilities
 	) -> PeerStatus { PeerStatus::Kept }
 	/// Called when a peer disconnects, with a list of unfulfilled request IDs as
 	/// of yet.
-	fn on_disconnect(&self, _ctx: &EventContext, _unfulfilled: &[ReqId]) { }
+	fn on_disconnect(&self, _ctx: &dyn EventContext, _unfulfilled: &[ReqId]) { }
 	/// Called when a peer makes an announcement.
-	fn on_announcement(&self, _ctx: &EventContext, _announcement: &Announcement) { }
+	fn on_announcement(&self, _ctx: &dyn EventContext, _announcement: &Announcement) { }
 	/// Called when a peer requests relay of some transactions.
-	fn on_transactions(&self, _ctx: &EventContext, _relay: &[UnverifiedTransaction]) { }
+	fn on_transactions(&self, _ctx: &dyn EventContext, _relay: &[UnverifiedTransaction]) { }
 	/// Called when a peer responds to requests.
 	/// Responses not guaranteed to contain valid data and are not yet checked against
 	/// the requests they correspond to.
-	fn on_responses(&self, _ctx: &EventContext, _req_id: ReqId, _responses: &[Response]) { }
+	fn on_responses(&self, _ctx: &dyn EventContext, _req_id: ReqId, _responses: &[Response]) { }
 	/// Called when a peer responds with a transaction proof. Each proof is a vector of state items.
-	fn on_transaction_proof(&self, _ctx: &EventContext, _req_id: ReqId, _state_items: &[DBValue]) { }
+	fn on_transaction_proof(&self, _ctx: &dyn EventContext, _req_id: ReqId, _state_items: &[DBValue]) { }
 	/// Called to "tick" the handler periodically.
-	fn tick(&self, _ctx: &BasicContext) { }
+	fn tick(&self, _ctx: &dyn BasicContext) { }
 	/// Called on abort. This signals to handlers that they should clean up
 	/// and ignore peers.
 	// TODO: coreresponding `on_activate`?
@@ -255,18 +265,18 @@ pub trait Handler: Send + Sync {
 pub struct Config {
 	/// How many stored seconds of credits peers should be able to accumulate.
 	pub max_stored_seconds: u64,
-	/// How much of the total load capacity each peer should be allowed to take.
-	pub load_share: f64,
+	/// The network config median peers (used as default peer count)
+	pub median_peers: f64,
 }
 
 impl Default for Config {
 	fn default() -> Self {
-		const LOAD_SHARE: f64 = 1.0 / 25.0;
+		const MEDIAN_PEERS: f64 = 25.0;
 		const MAX_ACCUMULATED: u64 = 60 * 5; // only charge for 5 minutes.
 
 		Config {
 			max_stored_seconds: MAX_ACCUMULATED,
-			load_share: LOAD_SHARE,
+			median_peers: MEDIAN_PEERS,
 		}
 	}
 }
@@ -280,7 +290,7 @@ pub struct Params {
 	/// Initial capabilities.
 	pub capabilities: Capabilities,
 	/// The sample store (`None` if data shouldn't persist between runs).
-	pub sample_store: Option<Box<SampleStore>>,
+	pub sample_store: Option<Box<dyn SampleStore>>,
 }
 
 /// Type alias for convenience.
@@ -308,9 +318,9 @@ mod id_guard {
 		/// (for forming responses, triggering handlers) until defused
 		pub fn new(peers: RwLockReadGuard<'a, PeerMap>, peer_id: PeerId, req_id: ReqId) -> Self {
 			IdGuard {
-				peers: peers,
-				peer_id: peer_id,
-				req_id: req_id,
+				peers,
+				peer_id,
+				req_id,
 				active: true,
 			}
 		}
@@ -334,6 +344,42 @@ mod id_guard {
 	}
 }
 
+/// Provides various statistics that could
+/// be used to compute costs
+pub struct Statistics {
+	/// Samples of peer count
+	peer_counts: VecDeque<usize>,
+}
+
+impl Statistics {
+	/// Create a new Statistics instance
+	pub fn new() -> Self {
+		Statistics {
+			peer_counts: VecDeque::with_capacity(MOVING_SAMPLE_SIZE),
+		}
+	}
+
+	/// Add a new peer_count sample
+	pub fn add_peer_count(&mut self, peer_count: usize) {
+		while self.peer_counts.len() >= MOVING_SAMPLE_SIZE {
+			self.peer_counts.pop_front();
+		}
+		self.peer_counts.push_back(peer_count);
+	}
+
+	/// Get the average peer count from previous samples. Is always >= 1.0
+	pub fn avg_peer_count(&self) -> f64 {
+		let len = self.peer_counts.len();
+		if len == 0 {
+			return 1.0;
+		}
+		let avg = self.peer_counts.iter()
+			.fold(0, |sum: u32, &v| sum.saturating_add(v as u32)) as f64
+			/ len as f64;
+		avg.max(1.0)
+	}
+}
+
 /// This is an implementation of the light ethereum network protocol, abstracted
 /// over a `Provider` of data and a p2p network.
 ///
@@ -345,7 +391,7 @@ mod id_guard {
 //   Locks must be acquired in the order declared, and when holding a read lock
 //   on the peers, only one peer may be held at a time.
 pub struct LightProtocol {
-	provider: Arc<Provider>,
+	provider: Arc<dyn Provider>,
 	config: Config,
 	genesis_hash: H256,
 	network_id: u64,
@@ -353,44 +399,50 @@ pub struct LightProtocol {
 	peers: RwLock<PeerMap>,
 	capabilities: RwLock<Capabilities>,
 	flow_params: RwLock<Arc<FlowParams>>,
-	handlers: Vec<Arc<Handler>>,
+	free_flow_params: Arc<FlowParams>,
+	handlers: Vec<Arc<dyn Handler>>,
 	req_id: AtomicUsize,
-	sample_store: Box<SampleStore>,
+	sample_store: Box<dyn SampleStore>,
 	load_distribution: LoadDistribution,
+	statistics: RwLock<Statistics>,
 }
 
 impl LightProtocol {
 	/// Create a new instance of the protocol manager.
-	pub fn new(provider: Arc<Provider>, params: Params) -> Self {
+	pub fn new(provider: Arc<dyn Provider>, params: Params) -> Self {
 		debug!(target: "pip", "Initializing light protocol handler");
 
 		let genesis_hash = provider.chain_info().genesis_hash;
 		let sample_store = params.sample_store.unwrap_or_else(|| Box::new(NullStore));
 		let load_distribution = LoadDistribution::load(&*sample_store);
+		// Default load share relative to median peers
+		let load_share = MAX_LIGHTSERV_LOAD / params.config.median_peers;
 		let flow_params = FlowParams::from_request_times(
-			|kind| load_distribution.expected_time_ns(kind),
-			params.config.load_share,
-			params.config.max_stored_seconds,
+			|kind| load_distribution.expected_time(kind),
+			load_share,
+			Duration::from_secs(params.config.max_stored_seconds),
 		);
 
 		LightProtocol {
-			provider: provider,
+			provider,
 			config: params.config,
-			genesis_hash: genesis_hash,
+			genesis_hash,
 			network_id: params.network_id,
 			pending_peers: RwLock::new(HashMap::new()),
 			peers: RwLock::new(HashMap::new()),
 			capabilities: RwLock::new(params.capabilities),
 			flow_params: RwLock::new(Arc::new(flow_params)),
+			free_flow_params: Arc::new(FlowParams::free()),
 			handlers: Vec::new(),
 			req_id: AtomicUsize::new(0),
-			sample_store: sample_store,
-			load_distribution: load_distribution,
+			sample_store,
+			load_distribution,
+			statistics: RwLock::new(Statistics::new()),
 		}
 	}
 
 	/// Attempt to get peer status.
-	pub fn peer_status(&self, peer: &PeerId) -> Option<Status> {
+	pub fn peer_status(&self, peer: PeerId) -> Option<Status> {
 		self.peers.read().get(&peer)
 			.map(|peer| peer.lock().status.clone())
 	}
@@ -405,15 +457,25 @@ impl LightProtocol {
 		)
 	}
 
+	/// Get the number of active light peers downloading from the
+	/// node
+	pub fn leecher_count(&self) -> usize {
+		let credit_limit = *self.flow_params.read().limit();
+		// Count the number of peers that used some credit
+		self.peers.read().iter()
+			.filter(|(_, p)| p.lock().local_credits.current() < credit_limit)
+			.count()
+	}
+
 	/// Make a request to a peer.
 	///
 	/// Fails on: nonexistent peer, network error, peer not server,
 	/// insufficient credits. Does not check capabilities before sending.
 	/// On success, returns a request id which can later be coordinated
 	/// with an event.
-	pub fn request_from(&self, io: &IoContext, peer_id: &PeerId, requests: Requests) -> Result<ReqId, Error> {
+	pub fn request_from(&self, io: &dyn IoContext, peer_id: PeerId, requests: Requests) -> Result<ReqId, Error> {
 		let peers = self.peers.read();
-		let peer = match peers.get(peer_id) {
+		let peer = match peers.get(&peer_id) {
 			Some(peer) => peer,
 			None => return Err(Error::UnknownPeer),
 		};
@@ -441,14 +503,14 @@ impl LightProtocol {
 					peer_id, cost, pre_creds);
 
 				let req_id = ReqId(self.req_id.fetch_add(1, Ordering::SeqCst));
-				io.send(*peer_id, packet::REQUEST, {
+				io.send(peer_id, packet::REQUEST, {
 					let mut stream = RlpStream::new_list(2);
 					stream.append(&req_id.0).append_list(&requests.requests());
 					stream.out()
 				});
 
 				// begin timeout.
-				peer.pending_requests.insert(req_id, requests, cost, SteadyTime::now());
+				peer.pending_requests.insert(req_id, requests, cost, Instant::now());
 				Ok(req_id)
 			}
 		}
@@ -456,9 +518,9 @@ impl LightProtocol {
 
 	/// Make an announcement of new chain head and capabilities to all peers.
 	/// The announcement is expected to be valid.
-	pub fn make_announcement(&self, io: &IoContext, mut announcement: Announcement) {
+	pub fn make_announcement(&self, io: &dyn IoContext, mut announcement: Announcement) {
 		let mut reorgs_map = HashMap::new();
-		let now = SteadyTime::now();
+		let now = Instant::now();
 
 		// update stored capabilities
 		self.capabilities.write().update_from(&announcement);
@@ -470,8 +532,11 @@ impl LightProtocol {
 			// TODO: "urgent" announcements like new blocks?
 			// the timer approach will skip 1 (possibly 2) in rare occasions.
 			if peer_info.sent_head == announcement.head_hash ||
-				peer_info.status.head_num >= announcement.head_num  ||
-				now - peer_info.last_update < Duration::milliseconds(UPDATE_INTERVAL_MS) {
+				peer_info.status.head_num >= announcement.head_num ||
+				// fix for underflow reported in
+				// https://github.com/openethereum/openethereum/issues/10419
+				now < peer_info.last_update ||
+				now - peer_info.last_update < UPDATE_INTERVAL {
 				continue
 			}
 
@@ -503,7 +568,7 @@ impl LightProtocol {
 	/// These are intended to be added when the protocol structure
 	/// is initialized as a means of customizing its behavior,
 	/// and dispatching requests immediately upon events.
-	pub fn add_handler(&mut self, handler: Arc<Handler>) {
+	pub fn add_handler(&mut self, handler: Arc<dyn Handler>) {
 		self.handlers.push(handler);
 	}
 
@@ -527,18 +592,18 @@ impl LightProtocol {
 	//   - check whether peer exists
 	//   - check whether request was made
 	//   - check whether request kinds match
-	fn pre_verify_response(&self, peer: &PeerId, raw: &UntrustedRlp) -> Result<IdGuard, Error> {
+	fn pre_verify_response(&self, peer: PeerId, raw: &Rlp) -> Result<IdGuard, Error> {
 		let req_id = ReqId(raw.val_at(0)?);
 		let cur_credits: U256 = raw.val_at(1)?;
 
 		trace!(target: "pip", "pre-verifying response for {} from peer {}", req_id, peer);
 
 		let peers = self.peers.read();
-		let res = match peers.get(peer) {
+		let res = match peers.get(&peer) {
 			Some(peer_info) => {
 				let mut peer_info = peer_info.lock();
 				let peer_info: &mut Peer = &mut *peer_info;
-				let req_info = peer_info.pending_requests.remove(&req_id, SteadyTime::now());
+				let req_info = peer_info.pending_requests.remove(req_id, Instant::now());
 				let last_batched = peer_info.pending_requests.is_empty();
 				let flow_info = peer_info.remote_flow.as_mut();
 
@@ -564,29 +629,29 @@ impl LightProtocol {
 			None => Err(Error::UnknownPeer), // probably only occurs in a race of some kind.
 		};
 
-		res.map(|_| IdGuard::new(peers, *peer, req_id))
+		res.map(|_| IdGuard::new(peers, peer, req_id))
 	}
 
 	/// Handle a packet using the given io context.
 	/// Packet data is _untrusted_, which means that invalid data won't lead to
 	/// issues.
-	pub fn handle_packet(&self, io: &IoContext, peer: &PeerId, packet_id: u8, data: &[u8]) {
-		let rlp = UntrustedRlp::new(data);
+	pub fn handle_packet(&self, io: &dyn IoContext, peer: PeerId, packet_id: u8, data: &[u8]) {
+		let rlp = Rlp::new(data);
 
 		trace!(target: "pip", "Incoming packet {} from peer {}", packet_id, peer);
 
 		// handle the packet
 		let res = match packet_id {
-			packet::STATUS => self.status(peer, io, rlp),
-			packet::ANNOUNCE => self.announcement(peer, io, rlp),
+			packet::STATUS => self.status(peer, io, &rlp),
+			packet::ANNOUNCE => self.announcement(peer, io, &rlp),
 
-			packet::REQUEST => self.request(peer, io, rlp),
-			packet::RESPONSE => self.response(peer, io, rlp),
+			packet::REQUEST => self.request(peer, io, &rlp),
+			packet::RESPONSE => self.response(peer, io, &rlp),
 
-			packet::UPDATE_CREDITS => self.update_credits(peer, io, rlp),
-			packet::ACKNOWLEDGE_UPDATE => self.acknowledge_update(peer, io, rlp),
+			packet::UPDATE_CREDITS => self.update_credits(peer, io, &rlp),
+			packet::ACKNOWLEDGE_UPDATE => self.acknowledge_update(peer, io, &rlp),
 
-			packet::SEND_TRANSACTIONS => self.relay_transactions(peer, io, rlp),
+			packet::SEND_TRANSACTIONS => self.relay_transactions(peer, io, &rlp),
 
 			other => {
 				Err(Error::UnrecognizedPacket(other))
@@ -594,20 +659,20 @@ impl LightProtocol {
 		};
 
 		if let Err(e) = res {
-			punish(*peer, io, e);
+			punish(peer, io, &e);
 		}
 	}
 
 	// check timeouts and punish peers.
-	fn timeout_check(&self, io: &IoContext) {
-		let now = SteadyTime::now();
+	fn timeout_check(&self, io: &dyn IoContext) {
+		let now = Instant::now();
 
 		// handshake timeout
 		{
 			let mut pending = self.pending_peers.write();
 			let slowpokes: Vec<_> = pending.iter()
 				.filter(|&(_, ref peer)| {
-					peer.last_update + Duration::milliseconds(timeout::HANDSHAKE) <= now
+					peer.last_update + timeout::HANDSHAKE <= now
 				})
 				.map(|(&p, _)| p)
 				.collect();
@@ -620,7 +685,7 @@ impl LightProtocol {
 		}
 
 		// request and update ack timeouts
-		let ack_duration = Duration::milliseconds(timeout::ACKNOWLEDGE_UPDATE);
+		let ack_duration = timeout::ACKNOWLEDGE_UPDATE;
 		{
 			for (peer_id, peer) in self.peers.read().iter() {
 				let peer = peer.lock();
@@ -641,10 +706,10 @@ impl LightProtocol {
 
 	// propagate transactions to relay peers.
 	// if we aren't on the mainnet, we just propagate to all relay peers
-	fn propagate_transactions(&self, io: &IoContext) {
+	fn propagate_transactions(&self, io: &dyn IoContext) {
 		if self.capabilities.read().tx_relay { return }
 
-		let ready_transactions = self.provider.ready_transactions();
+		let ready_transactions = self.provider.transactions_to_propagate();
 		if ready_transactions.is_empty() { return }
 
 		trace!(target: "pip", "propagate transactions: {} ready", ready_transactions.len());
@@ -681,14 +746,14 @@ impl LightProtocol {
 	}
 
 	/// called when a peer connects.
-	pub fn on_connect(&self, peer: &PeerId, io: &IoContext) {
-		let proto_version = match io.protocol_version(*peer).ok_or(Error::WrongNetwork) {
+	pub fn on_connect(&self, peer: PeerId, io: &dyn IoContext) {
+		let proto_version = match io.protocol_version(peer).ok_or(Error::WrongNetwork) {
 			Ok(pv) => pv,
-			Err(e) => { punish(*peer, io, e); return }
+			Err(e) => { punish(peer, io, &e); return }
 		};
 
-		if PROTOCOL_VERSIONS.iter().find(|x| **x == proto_version).is_none() {
-			punish(*peer, io, Error::UnsupportedProtocolVersion(proto_version));
+		if PROTOCOL_VERSIONS.iter().find(|x| x.0 == proto_version).is_none() {
+			punish(peer, io, &Error::UnsupportedProtocolVersion(proto_version));
 			return;
 		}
 
@@ -704,21 +769,26 @@ impl LightProtocol {
 			last_head: None,
 		};
 
-		let capabilities = self.capabilities.read().clone();
-		let local_flow = self.flow_params.read();
-		let status_packet = status::write_handshake(&status, &capabilities, Some(&**local_flow));
+		let capabilities = self.capabilities.read();
+		let cost_local_flow = self.flow_params.read();
+		let local_flow = if io.is_reserved_peer(peer) {
+			&*self.free_flow_params
+		} else {
+			&**cost_local_flow
+		};
+		let status_packet = status::write_handshake(&status, &capabilities, Some(local_flow));
 
-		self.pending_peers.write().insert(*peer, PendingPeer {
+		self.pending_peers.write().insert(peer, PendingPeer {
 			sent_head: chain_info.best_block_hash,
-			last_update: SteadyTime::now(),
+			last_update: Instant::now(),
 		});
 
 		trace!(target: "pip", "Sending status to peer {}", peer);
-		io.send(*peer, packet::STATUS, status_packet);
+		io.send(peer, packet::STATUS, status_packet);
 	}
 
 	/// called when a peer disconnects.
-	pub fn on_disconnect(&self, peer: PeerId, io: &IoContext) {
+	pub fn on_disconnect(&self, peer: PeerId, io: &dyn IoContext) {
 		trace!(target: "pip", "Peer {} disconnecting", peer);
 
 		self.pending_peers.write().remove(&peer);
@@ -735,44 +805,48 @@ impl LightProtocol {
 
 		for handler in &self.handlers {
 			handler.on_disconnect(&Ctx {
-				peer: peer,
-				io: io,
+				peer,
+				io,
 				proto: self,
 			}, &unfulfilled)
 		}
 	}
 
 	/// Execute the given closure with a basic context derived from the I/O context.
-	pub fn with_context<F, T>(&self, io: &IoContext, f: F) -> T
-		where F: FnOnce(&BasicContext) -> T
+	pub fn with_context<F, T>(&self, io: &dyn IoContext, f: F) -> T
+		where F: FnOnce(&dyn BasicContext) -> T
 	{
 		f(&TickCtx {
-			io: io,
+			io,
 			proto: self,
 		})
 	}
 
-	fn tick_handlers(&self, io: &IoContext) {
+	fn tick_handlers(&self, io: &dyn IoContext) {
 		for handler in &self.handlers {
 			handler.tick(&TickCtx {
-				io: io,
+				io,
 				proto: self,
 			})
 		}
 	}
 
-	fn begin_new_cost_period(&self, io: &IoContext) {
+	fn begin_new_cost_period(&self, io: &dyn IoContext) {
 		self.load_distribution.end_period(&*self.sample_store);
 
+		let avg_peer_count = self.statistics.read().avg_peer_count();
+		// Load share relative to average peer count +LEECHER_COUNT_FACTOR%
+		let load_share = MAX_LIGHTSERV_LOAD / (avg_peer_count * LEECHER_COUNT_FACTOR);
 		let new_params = Arc::new(FlowParams::from_request_times(
-			|kind| self.load_distribution.expected_time_ns(kind),
-			self.config.load_share,
-			self.config.max_stored_seconds,
+			|kind| self.load_distribution.expected_time(kind),
+			load_share,
+			Duration::from_secs(self.config.max_stored_seconds),
 		));
 		*self.flow_params.write() = new_params.clone();
+		trace!(target: "pip", "New cost period: avg_peers={} ; cost_table:{:?}", avg_peer_count, new_params.cost_table());
 
 		let peers = self.peers.read();
-		let now = SteadyTime::now();
+		let now = Instant::now();
 
 		let packet_body = {
 			let mut stream = RlpStream::new_list(3);
@@ -786,15 +860,20 @@ impl LightProtocol {
 			let mut peer_info = peer_info.lock();
 
 			io.send(*peer_id, packet::UPDATE_CREDITS, packet_body.clone());
-			peer_info.awaiting_acknowledge = Some((now.clone(), new_params.clone()));
+			peer_info.awaiting_acknowledge = Some((now, new_params.clone()));
 		}
+	}
+
+	fn tick_statistics(&self) {
+		let leecher_count = self.leecher_count();
+		self.statistics.write().add_peer_count(leecher_count);
 	}
 }
 
 impl LightProtocol {
 	// Handle status message from peer.
-	fn status(&self, peer: &PeerId, io: &IoContext, data: UntrustedRlp) -> Result<(), Error> {
-		let pending = match self.pending_peers.write().remove(peer) {
+	fn status(&self, peer: PeerId, io: &dyn IoContext, data: &Rlp) -> Result<(), Error> {
+		let pending = match self.pending_peers.write().remove(&peer) {
 			Some(pending) => pending,
 			None => {
 				return Err(Error::UnexpectedHandshake);
@@ -812,33 +891,37 @@ impl LightProtocol {
 			return Err(Error::WrongNetwork);
 		}
 
-		if Some(status.protocol_version as u8) != io.protocol_version(*peer) {
+		if Some(status.protocol_version as u8) != io.protocol_version(peer) {
 			return Err(Error::BadProtocolVersion);
 		}
 
 		let remote_flow = flow_params.map(|params| (params.create_credits(), params));
-		let local_flow = self.flow_params.read().clone();
+		let local_flow = if io.is_reserved_peer(peer) {
+			self.free_flow_params.clone()
+		} else {
+			self.flow_params.read().clone()
+		};
 
-		self.peers.write().insert(*peer, Mutex::new(Peer {
+		self.peers.write().insert(peer, Mutex::new(Peer {
 			local_credits: local_flow.create_credits(),
 			status: status.clone(),
-			capabilities: capabilities.clone(),
-			remote_flow: remote_flow,
+			capabilities,
+			remote_flow,
 			sent_head: pending.sent_head,
 			last_update: pending.last_update,
 			pending_requests: RequestSet::default(),
 			failed_requests: Vec::new(),
 			propagated_transactions: HashSet::new(),
 			skip_update: false,
-			local_flow: local_flow,
+			local_flow,
 			awaiting_acknowledge: None,
 		}));
 
 		let any_kept = self.handlers.iter().map(
 			|handler| handler.on_connect(
 				&Ctx {
-					peer: *peer,
-					io: io,
+					peer,
+					io,
 					proto: self,
 				},
 				&status,
@@ -854,8 +937,8 @@ impl LightProtocol {
 	}
 
 	// Handle an announcement.
-	fn announcement(&self, peer: &PeerId, io: &IoContext, data: UntrustedRlp) -> Result<(), Error> {
-		if !self.peers.read().contains_key(peer) {
+	fn announcement(&self, peer: PeerId, io: &dyn IoContext, data: &Rlp) -> Result<(), Error> {
+		if !self.peers.read().contains_key(&peer) {
 			debug!(target: "pip", "Ignoring announcement from unknown peer");
 			return Ok(())
 		}
@@ -865,7 +948,7 @@ impl LightProtocol {
 		// scope to ensure locks are dropped before moving into handler-space.
 		{
 			let peers = self.peers.read();
-			let peer_info = match peers.get(peer) {
+			let peer_info = match peers.get(&peer) {
 				Some(info) => info,
 				None => return Ok(()),
 			};
@@ -889,8 +972,8 @@ impl LightProtocol {
 
 		for handler in &self.handlers {
 			handler.on_announcement(&Ctx {
-				peer: *peer,
-				io: io,
+				peer,
+				io,
 				proto: self,
 			}, &announcement);
 		}
@@ -899,7 +982,7 @@ impl LightProtocol {
 	}
 
 	// Receive requests from a peer.
-	fn request(&self, peer_id: &PeerId, io: &IoContext, raw: UntrustedRlp) -> Result<(), Error> {
+	fn request(&self, peer_id: PeerId, io: &dyn IoContext, raw: &Rlp) -> Result<(), Error> {
 		// the maximum amount of requests we'll fill in a single packet.
 		const MAX_REQUESTS: usize = 256;
 
@@ -907,7 +990,7 @@ impl LightProtocol {
 		use ::request::CompleteRequest;
 
 		let peers = self.peers.read();
-		let peer = match peers.get(peer_id) {
+		let peer = match peers.get(&peer_id) {
 			Some(peer) => peer,
 			None => {
 				debug!(target: "pip", "Ignoring request from unknown peer");
@@ -967,7 +1050,7 @@ impl LightProtocol {
 	}
 
 	// handle a packet with responses.
-	fn response(&self, peer: &PeerId, io: &IoContext, raw: UntrustedRlp) -> Result<(), Error> {
+	fn response(&self, peer: PeerId, io: &dyn IoContext, raw: &Rlp) -> Result<(), Error> {
 		let (req_id, responses) = {
 			let id_guard = self.pre_verify_response(peer, &raw)?;
 			let responses: Vec<Response> = raw.list_at(2)?;
@@ -976,9 +1059,9 @@ impl LightProtocol {
 
 		for handler in &self.handlers {
 			handler.on_responses(&Ctx {
-				io: io,
+				io,
 				proto: self,
-				peer: *peer,
+				peer,
 			}, req_id, &responses);
 		}
 
@@ -986,10 +1069,10 @@ impl LightProtocol {
 	}
 
 	// handle an update of request credits parameters.
-	fn update_credits(&self, peer_id: &PeerId, io: &IoContext, raw: UntrustedRlp) -> Result<(), Error> {
+	fn update_credits(&self, peer_id: PeerId, io: &dyn IoContext, raw: &Rlp) -> Result<(), Error> {
 		let peers = self.peers.read();
 
-		let peer = peers.get(peer_id).ok_or(Error::UnknownPeer)?;
+		let peer = peers.get(&peer_id).ok_or(Error::UnknownPeer)?;
 		let mut peer = peer.lock();
 
 		trace!(target: "pip", "Received an update to request credit params from peer {}", peer_id);
@@ -1021,9 +1104,9 @@ impl LightProtocol {
 	}
 
 	// handle an acknowledgement of request credits update.
-	fn acknowledge_update(&self, peer_id: &PeerId, _io: &IoContext, _raw: UntrustedRlp) -> Result<(), Error> {
+	fn acknowledge_update(&self, peer_id: PeerId, _io: &dyn IoContext, _raw: &Rlp) -> Result<(), Error> {
 		let peers = self.peers.read();
-		let peer = peers.get(peer_id).ok_or(Error::UnknownPeer)?;
+		let peer = peers.get(&peer_id).ok_or(Error::UnknownPeer)?;
 		let mut peer = peer.lock();
 
 		trace!(target: "pip", "Received an acknowledgement for new request credit params from peer {}", peer_id);
@@ -1040,7 +1123,7 @@ impl LightProtocol {
 	}
 
 	// Receive a set of transactions to relay.
-	fn relay_transactions(&self, peer: &PeerId, io: &IoContext, data: UntrustedRlp) -> Result<(), Error> {
+	fn relay_transactions(&self, peer: PeerId, io: &dyn IoContext, data: &Rlp) -> Result<(), Error> {
 		const MAX_TRANSACTIONS: usize = 256;
 
 		let txs: Vec<_> = data.iter()
@@ -1052,8 +1135,8 @@ impl LightProtocol {
 
 		for handler in &self.handlers {
 			handler.on_transactions(&Ctx {
-				peer: *peer,
-				io: io,
+				peer,
+				io,
 				proto: self,
 			}, &txs);
 		}
@@ -1063,7 +1146,7 @@ impl LightProtocol {
 }
 
 // if something went wrong, figure out how much to punish the peer.
-fn punish(peer: PeerId, io: &IoContext, e: Error) {
+fn punish(peer: PeerId, io: &dyn IoContext, e: &Error) {
 	match e.punishment() {
 		Punishment::None => {}
 		Punishment::Disconnect => {
@@ -1078,35 +1161,38 @@ fn punish(peer: PeerId, io: &IoContext, e: Error) {
 }
 
 impl NetworkProtocolHandler for LightProtocol {
-	fn initialize(&self, io: &NetworkContext, _host_info: &HostInfo) {
-		io.register_timer(TIMEOUT, TIMEOUT_INTERVAL_MS)
+	fn initialize(&self, io: &dyn NetworkContext) {
+		io.register_timer(TIMEOUT, TIMEOUT_INTERVAL)
 			.expect("Error registering sync timer.");
-		io.register_timer(TICK_TIMEOUT, TICK_TIMEOUT_INTERVAL_MS)
+		io.register_timer(TICK_TIMEOUT, TICK_TIMEOUT_INTERVAL)
 			.expect("Error registering sync timer.");
-		io.register_timer(PROPAGATE_TIMEOUT, PROPAGATE_TIMEOUT_INTERVAL_MS)
+		io.register_timer(PROPAGATE_TIMEOUT, PROPAGATE_TIMEOUT_INTERVAL)
 			.expect("Error registering sync timer.");
-		io.register_timer(RECALCULATE_COSTS_TIMEOUT, RECALCULATE_COSTS_INTERVAL_MS)
+		io.register_timer(RECALCULATE_COSTS_TIMEOUT, RECALCULATE_COSTS_INTERVAL)
 			.expect("Error registering request timer interval token.");
+		io.register_timer(STATISTICS_TIMEOUT, STATISTICS_INTERVAL)
+			.expect("Error registering statistics timer.");
 	}
 
-	fn read(&self, io: &NetworkContext, peer: &PeerId, packet_id: u8, data: &[u8]) {
-		self.handle_packet(io, peer, packet_id, data);
+	fn read(&self, io: &dyn NetworkContext, peer: &PeerId, packet_id: u8, data: &[u8]) {
+		self.handle_packet(&io, *peer, packet_id, data);
 	}
 
-	fn connected(&self, io: &NetworkContext, peer: &PeerId) {
-		self.on_connect(peer, io);
+	fn connected(&self, io: &dyn NetworkContext, peer: &PeerId) {
+		self.on_connect(*peer, &io);
 	}
 
-	fn disconnected(&self, io: &NetworkContext, peer: &PeerId) {
-		self.on_disconnect(*peer, io);
+	fn disconnected(&self, io: &dyn NetworkContext, peer: &PeerId) {
+		self.on_disconnect(*peer, &io);
 	}
 
-	fn timeout(&self, io: &NetworkContext, timer: TimerToken) {
+	fn timeout(&self, io: &dyn NetworkContext, timer: TimerToken) {
 		match timer {
-			TIMEOUT => self.timeout_check(io),
-			TICK_TIMEOUT => self.tick_handlers(io),
-			PROPAGATE_TIMEOUT => self.propagate_transactions(io),
-			RECALCULATE_COSTS_TIMEOUT => self.begin_new_cost_period(io),
+			TIMEOUT => self.timeout_check(&io),
+			TICK_TIMEOUT => self.tick_handlers(&io),
+			PROPAGATE_TIMEOUT => self.propagate_transactions(&io),
+			RECALCULATE_COSTS_TIMEOUT => self.begin_new_cost_period(&io),
+			STATISTICS_TIMEOUT => self.tick_statistics(),
 			_ => warn!(target: "pip", "received timeout on unknown token {}", timer),
 		}
 	}

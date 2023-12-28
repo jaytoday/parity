@@ -1,27 +1,27 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 use compute::Light;
 use either::Either;
 use keccak::{H256, keccak_512};
-use memmap::{Mmap, Protection};
+use memmap::MmapMut;
 use parking_lot::Mutex;
 use seed_compute::SeedHashCompute;
 
-use shared::{ETHASH_CACHE_ROUNDS, NODE_BYTES, NODE_DWORDS, Node, epoch, get_cache_size, to_hex};
+use shared::{ETHASH_CACHE_ROUNDS, NODE_BYTES, Node, epoch, get_cache_size, to_hex};
 
 use std::borrow::Cow;
 use std::fs;
@@ -30,19 +30,9 @@ use std::path::{Path, PathBuf};
 use std::slice;
 use std::sync::Arc;
 
-type Cache = Either<Vec<Node>, Mmap>;
+use common_types::engines::OptimizeFor;
 
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
-pub enum OptimizeFor {
-	Cpu,
-	Memory,
-}
-
-impl Default for OptimizeFor {
-	fn default() -> Self {
-		OptimizeFor::Cpu
-	}
-}
+type Cache = Either<Vec<Node>, MmapMut>;
 
 fn byte_size(cache: &Cache) -> usize {
 	use self::Either::{Left, Right};
@@ -69,6 +59,7 @@ pub struct NodeCacheBuilder {
 	// TODO: Remove this locking and just use an `Rc`?
 	seedhash: Arc<Mutex<SeedHashCompute>>,
 	optimize_for: OptimizeFor,
+	progpow_transition: u64,
 }
 
 // TODO: Abstract the "optimize for" logic
@@ -82,17 +73,18 @@ pub struct NodeCache {
 
 impl NodeCacheBuilder {
 	pub fn light(&self, cache_dir: &Path, block_number: u64) -> Light {
-		Light::new_with_builder(self, cache_dir, block_number)
+		Light::new_with_builder(self, cache_dir, block_number, self.progpow_transition)
 	}
 
 	pub fn light_from_file(&self, cache_dir: &Path, block_number: u64) -> io::Result<Light> {
-		Light::from_file_with_builder(self, cache_dir, block_number)
+		Light::from_file_with_builder(self, cache_dir, block_number, self.progpow_transition)
 	}
 
-	pub fn new<T: Into<Option<OptimizeFor>>>(optimize_for: T) -> Self {
+	pub fn new<T: Into<Option<OptimizeFor>>>(optimize_for: T, progpow_transition: u64) -> Self {
 		NodeCacheBuilder {
-			seedhash: Arc::new(Mutex::new(SeedHashCompute::new())),
+			seedhash: Arc::new(Mutex::new(SeedHashCompute::default())),
 			optimize_for: optimize_for.into().unwrap_or_default(),
+			progpow_transition
 		}
 	}
 
@@ -181,7 +173,7 @@ impl NodeCache {
 	}
 }
 
-fn make_memmapped_cache(path: &Path, num_nodes: usize, ident: &H256) -> io::Result<Mmap> {
+fn make_memmapped_cache(path: &Path, num_nodes: usize, ident: &H256) -> io::Result<MmapMut> {
 	use std::fs::OpenOptions;
 
 	let file = OpenOptions::new()
@@ -191,9 +183,9 @@ fn make_memmapped_cache(path: &Path, num_nodes: usize, ident: &H256) -> io::Resu
 		.open(&path)?;
 	file.set_len((num_nodes * NODE_BYTES) as _)?;
 
-	let mut memmap = Mmap::open(&file, Protection::ReadWrite)?;
+	let mut memmap = unsafe { MmapMut::map_mut(&file)? };
 
-	unsafe { initialize_memory(memmap.mut_ptr() as *mut Node, num_nodes, ident) };
+	unsafe { initialize_memory(memmap.as_mut_ptr() as *mut Node, num_nodes, ident) };
 
 	Ok(memmap)
 }
@@ -241,7 +233,10 @@ fn consume_cache(cache: &mut Cache, path: &Path) -> io::Result<()> {
 fn cache_from_path(path: &Path, optimize_for: OptimizeFor) -> io::Result<Cache> {
 	let memmap = match optimize_for {
 		OptimizeFor::Cpu => None,
-		OptimizeFor::Memory => Mmap::open_path(path, Protection::ReadWrite).ok(),
+		OptimizeFor::Memory => {
+			let file = fs::OpenOptions::new().read(true).write(true).create(true).open(path)?;
+			unsafe { MmapMut::map_mut(&file).ok() }
+		},
 	};
 
 	memmap.map(Either::Right).ok_or(()).or_else(|_| {
@@ -287,7 +282,7 @@ impl AsRef<[Node]> for NodeCache {
 		match self.cache {
 			Either::Left(ref vec) => vec,
 			Either::Right(ref mmap) => unsafe {
-				let bytes = mmap.ptr();
+				let bytes = mmap.as_ptr();
 				// This isn't a safety issue, so we can keep this a debug lint. We don't care about
 				// people manually messing with the files unless it can cause unsafety, but if we're
 				// generating incorrect files then we want to catch that in CI.
@@ -306,27 +301,28 @@ impl AsRef<[Node]> for NodeCache {
 // out. It counts as a read and causes all writes afterwards to be elided. Yes, really. I know, I
 // want to refactor this to use less `unsafe` as much as the next rustacean.
 unsafe fn initialize_memory(memory: *mut Node, num_nodes: usize, ident: &H256) {
-	let dst = memory as *mut u8;
+	// We use raw pointers here, see above
+	let dst = slice::from_raw_parts_mut(memory as *mut u8, NODE_BYTES);
 
 	debug_assert_eq!(ident.len(), 32);
-	keccak_512::unchecked(dst, NODE_BYTES, ident.as_ptr(), ident.len());
+	keccak_512::write(&ident[..], dst);
 
 	for i in 1..num_nodes {
 		// We use raw pointers here, see above
-		let dst = memory.offset(i as _) as *mut u8;
-		let src = memory.offset(i as isize - 1) as *mut u8;
-
-		keccak_512::unchecked(dst, NODE_BYTES, src, NODE_BYTES);
+		let dst = slice::from_raw_parts_mut(
+			memory.offset(i as _) as *mut u8,
+			NODE_BYTES,
+		);
+		let src = slice::from_raw_parts(
+			memory.offset(i as isize - 1) as *mut u8,
+			NODE_BYTES,
+		);
+		keccak_512::write(src, dst);
 	}
 
 	// Now this is initialized, we can treat it as a slice.
 	let nodes: &mut [Node] = slice::from_raw_parts_mut(memory, num_nodes);
 
-	// For `unroll!`, see below. If the literal in `unroll!` is not the same as the RHS here then
-	// these have got out of sync! Don't let this happen!
-	debug_assert_eq!(NODE_DWORDS, 8);
-
-	// This _should_ get unrolled by the compiler, since it's not using the loop variable.
 	for _ in 0..ETHASH_CACHE_ROUNDS {
 		for i in 0..num_nodes {
 			let data_idx = (num_nodes - 1 + i) % num_nodes;
@@ -336,11 +332,8 @@ unsafe fn initialize_memory(memory: *mut Node, num_nodes: usize, ident: &H256) {
 				let mut data: Node = nodes.get_unchecked(data_idx).clone();
 				let rhs: &Node = nodes.get_unchecked(idx);
 
-				unroll! {
-					for w in 0..8 {
-						*data.as_dwords_mut().get_unchecked_mut(w) ^=
-							*rhs.as_dwords().get_unchecked(w);
-					}
+				for (a, b) in data.as_dwords_mut().iter_mut().zip(rhs.as_dwords()) {
+					*a ^= *b;
 				}
 
 				data

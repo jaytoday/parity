@@ -1,27 +1,26 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Blockchain filter
 
-use util::Address;
-use bigint::hash::{H256, H2048};
-use bloomable::Bloomable;
-use ids::BlockId;
-use log_entry::LogEntry;
-use hash::keccak;
+use crate::{
+	ids::BlockId,
+	log_entry::LogEntry,
+};
+use ethereum_types::{H256, Address, Bloom, BloomInput};
 
 /// Blockchain Filter.
 #[derive(Debug, PartialEq)]
@@ -75,15 +74,13 @@ impl Clone for Filter {
 
 impl Filter {
 	/// Returns combinations of each address and topic.
-	pub fn bloom_possibilities(&self) -> Vec<H2048> {
+	pub fn bloom_possibilities(&self) -> Vec<Bloom> {
 		let blooms = match self.address {
 			Some(ref addresses) if !addresses.is_empty() =>
-				addresses.iter().map(|ref address| {
-					let mut bloom = H2048::default();
-					bloom.shift_bloomed(&keccak(address));
-					bloom
-				}).collect(),
-			_ => vec![H2048::default()]
+				addresses.iter()
+					.map(|ref address| Bloom::from(BloomInput::Raw(address.as_bytes())))
+					.collect(),
+			_ => vec![Bloom::default()]
 		};
 
 		self.topics.iter().fold(blooms, |bs, topic| match *topic {
@@ -91,9 +88,9 @@ impl Filter {
 			Some(ref topics) => bs.into_iter().flat_map(|bloom| {
 				topics.into_iter().map(|topic| {
 					let mut b = bloom.clone();
-					b.shift_bloomed(&keccak(topic));
+					b.accrue(BloomInput::Raw(topic.as_bytes()));
 					b
-				}).collect::<Vec<H2048>>()
+				}).collect::<Vec<Bloom>>()
 			}).collect()
 		})
 	}
@@ -114,9 +111,13 @@ impl Filter {
 
 #[cfg(test)]
 mod tests {
-	use filter::Filter;
-	use ids::BlockId;
-	use log_entry::LogEntry;
+	use ethereum_types::{Bloom, Address, H256};
+	use crate::{
+		filter::Filter,
+		ids::BlockId,
+		log_entry::LogEntry,
+	};
+	use std::str::FromStr;
 
 	#[test]
 	fn test_bloom_possibilities_none() {
@@ -139,9 +140,9 @@ mod tests {
 		let filter = Filter {
 			from_block: BlockId::Earliest,
 			to_block: BlockId::Latest,
-			address: Some(vec!["b372018f3be9e171df0581136b59d2faf73a7d5d".into()]),
+			address: Some(vec![Address::from_str("b372018f3be9e171df0581136b59d2faf73a7d5d").unwrap()]),
 			topics: vec![
-				Some(vec!["ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9".into()]),
+				Some(vec![H256::from_str("ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9").unwrap()]),
 				None,
 				None,
 				None,
@@ -150,7 +151,7 @@ mod tests {
 		};
 
 		let possibilities = filter.bloom_possibilities();
-		assert_eq!(possibilities, vec!["00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000000004000000004000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000000000000000".into()]);
+		assert_eq!(possibilities, vec![Bloom::from_str("00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000000004000000004000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000000000000000").unwrap()]);
 	}
 
 	#[test]
@@ -158,10 +159,10 @@ mod tests {
 		let filter = Filter {
 			from_block: BlockId::Earliest,
 			to_block: BlockId::Latest,
-			address: Some(vec!["b372018f3be9e171df0581136b59d2faf73a7d5d".into()]),
+			address: Some(vec![Address::from_str("b372018f3be9e171df0581136b59d2faf73a7d5d").unwrap()]),
 			topics: vec![
-				Some(vec!["ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9".into()]),
-				Some(vec!["ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9".into()]),
+				Some(vec![H256::from_str("ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9").unwrap()]),
+				Some(vec![H256::from_str("ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9").unwrap()]),
 				None,
 				None,
 			],
@@ -169,7 +170,7 @@ mod tests {
 		};
 
 		let possibilities = filter.bloom_possibilities();
-		assert_eq!(possibilities, vec!["00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000000004000000004000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000000000000000".into()]);
+		assert_eq!(possibilities, vec![Bloom::from_str("00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000000004000000004000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000000000000000").unwrap()]);
 	}
 
 	#[test]
@@ -178,19 +179,19 @@ mod tests {
 			from_block: BlockId::Earliest,
 			to_block: BlockId::Latest,
 			address: Some(vec![
-						  "b372018f3be9e171df0581136b59d2faf73a7d5d".into(),
-						  "b372018f3be9e171df0581136b59d2faf73a7d5d".into(),
+						  Address::from_str("b372018f3be9e171df0581136b59d2faf73a7d5d").unwrap(),
+						  Address::from_str("b372018f3be9e171df0581136b59d2faf73a7d5d").unwrap(),
 			]),
 			topics: vec![
 				Some(vec![
-					 "ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9".into(),
-					 "ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9".into()
+					 H256::from_str("ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9").unwrap(),
+					 H256::from_str("ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9").unwrap()
 				]),
 				Some(vec![
-					 "ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9".into(),
-					 "ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9".into()
+					 H256::from_str("ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9").unwrap(),
+					 H256::from_str("ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9").unwrap()
 				]),
-				Some(vec!["ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9".into()]),
+				Some(vec![H256::from_str("ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9").unwrap()]),
 				None
 			],
 			limit: None,
@@ -199,7 +200,7 @@ mod tests {
 		// number of possibilites should be equal 2 * 2 * 2 * 1 = 8
 		let possibilities = filter.bloom_possibilities();
 		assert_eq!(possibilities.len(), 8);
-		assert_eq!(possibilities[0], "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000000004000000004000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000000000000000".into());
+		assert_eq!(possibilities[0], Bloom::from_str("00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000000004000000004000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000000000000000").unwrap());
 	}
 
 	#[test]
@@ -207,10 +208,10 @@ mod tests {
 		let filter = Filter {
 			from_block: BlockId::Earliest,
 			to_block: BlockId::Latest,
-			address: Some(vec!["b372018f3be9e171df0581136b59d2faf73a7d5d".into()]),
+			address: Some(vec![Address::from_str("b372018f3be9e171df0581136b59d2faf73a7d5d").unwrap()]),
 			topics: vec![
-				Some(vec!["ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9".into()]),
-				Some(vec!["ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23fa".into()]),
+				Some(vec![H256::from_str("ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9").unwrap()]),
+				Some(vec![H256::from_str("ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23fa").unwrap()]),
 				None,
 				None,
 			],
@@ -218,29 +219,29 @@ mod tests {
 		};
 
 		let entry0 = LogEntry {
-			address: "b372018f3be9e171df0581136b59d2faf73a7d5d".into(),
+			address: Address::from_str("b372018f3be9e171df0581136b59d2faf73a7d5d").unwrap(),
 			topics: vec![
-				"ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9".into(),
-				"ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23fa".into(),
-				"ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9".into(),
+				H256::from_str("ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9").unwrap(),
+				H256::from_str("ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23fa").unwrap(),
+				H256::from_str("ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9").unwrap(),
 			],
 			data: vec![]
 		};
 
 		let entry1 = LogEntry {
-			address: "b372018f3be9e171df0581136b59d2faf73a7d5e".into(),
+			address: Address::from_str("b372018f3be9e171df0581136b59d2faf73a7d5e").unwrap(),
 			topics: vec![
-				"ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9".into(),
-				"ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23fa".into(),
-				"ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9".into(),
+				H256::from_str("ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9").unwrap(),
+				H256::from_str("ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23fa").unwrap(),
+				H256::from_str("ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9").unwrap(),
 			],
 			data: vec![]
 		};
 
 		let entry2 = LogEntry {
-			address: "b372018f3be9e171df0581136b59d2faf73a7d5d".into(),
+			address: Address::from_str("b372018f3be9e171df0581136b59d2faf73a7d5d").unwrap(),
 			topics: vec![
-				"ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9".into(),
+				H256::from_str("ff74e91598aed6ae5d2fdcf8b24cd2c7be49a0808112a305069355b7160f23f9").unwrap(),
 			],
 			data: vec![]
 		};

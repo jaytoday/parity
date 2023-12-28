@@ -1,20 +1,22 @@
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Return data structures
 
-use bigint::prelude::U256;
+use ethereum_types::U256;
 
 /// Return data buffer. Holds memory from a previous call and a slice into that memory.
 #[derive(Debug)]
@@ -42,11 +44,7 @@ impl ReturnData {
 	}
 	/// Create `ReturnData` from give buffer and slice.
 	pub fn new(mem: Vec<u8>, offset: usize, size: usize) -> Self {
-		ReturnData {
-			mem: mem,
-			offset: offset,
-			size: size,
-		}
+		ReturnData { mem, offset, size }
 	}
 }
 

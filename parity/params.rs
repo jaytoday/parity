@@ -1,41 +1,56 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{str, fs, fmt};
+use std::collections::HashSet;
 use std::time::Duration;
-use bigint::prelude::U256;
-use util::{Address, version_data};
-use util::journaldb::Algorithm;
-use ethcore::spec::{Spec, SpecParams};
-use ethcore::ethereum;
-use ethcore::client::Mode;
-use ethcore::miner::{GasPricer, GasPriceCalibratorOptions};
+use std::{str, fs, fmt};
+
+use spec::{Spec, SpecParams, self};
+use ethereum_types::{U256, Address};
+use parity_runtime::Executor;
 use hash_fetch::fetch::Client as FetchClient;
+use journaldb::Algorithm;
+use miner::gas_pricer::GasPricer;
+use miner::gas_price_calibrator::{GasPriceCalibratorOptions, GasPriceCalibrator};
+use parity_version::version_data;
 use user_defaults::UserDefaults;
+use types::client_types::Mode;
+
+use crate::configuration;
 
 #[derive(Debug, PartialEq)]
 pub enum SpecType {
 	Foundation,
-	Morden,
+	Poanet,
+	Xdai,
+	Volta,
+	Ewc,
+	Musicoin,
+	Ellaism,
+	Mix,
+	Callisto,
+	EtherCore,
 	Ropsten,
 	Kovan,
-	Olympic,
-	Classic,
-	Expanse,
-	Musicoin,
+	Rinkeby,
+	Goerli,
+	YOLOv1,
+	Sokol,
+	Evantestcore,
+	Evancore,
 	Dev,
 	Custom(String),
 }
@@ -51,14 +66,24 @@ impl str::FromStr for SpecType {
 
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
 		let spec = match s {
-			"foundation" | "frontier" | "homestead" | "mainnet" => SpecType::Foundation,
-			"frontier-dogmatic" | "homestead-dogmatic" | "classic" => SpecType::Classic,
-			"morden" | "classic-testnet" => SpecType::Morden,
-			"ropsten" => SpecType::Ropsten,
-			"kovan" | "testnet" => SpecType::Kovan,
-			"olympic" => SpecType::Olympic,
-			"expanse" => SpecType::Expanse,
+			"eth" | "ethereum"  | "foundation" | "mainnet" => SpecType::Foundation,
+			"poanet" | "poacore" => SpecType::Poanet,
+			"xdai" => SpecType::Xdai,
+			"volta" => SpecType::Volta,
+			"ewc" | "energyweb" => SpecType::Ewc,
 			"musicoin" => SpecType::Musicoin,
+			"ellaism" => SpecType::Ellaism,
+			"mix" => SpecType::Mix,
+			"callisto" => SpecType::Callisto,
+			"ethercore" => SpecType::EtherCore,
+			"ropsten" => SpecType::Ropsten,
+			"kovan" => SpecType::Kovan,
+			"rinkeby" => SpecType::Rinkeby,
+			"goerli" | "görli" | "testnet" => SpecType::Goerli,
+			"yolo" | "yolov1" => SpecType::YOLOv1,
+			"sokol" | "poasokol" => SpecType::Sokol,
+			"evantestcore" => SpecType::Evantestcore,
+			"evancore" => SpecType::Evancore,
 			"dev" => SpecType::Dev,
 			other => SpecType::Custom(other.into()),
 		};
@@ -70,13 +95,23 @@ impl fmt::Display for SpecType {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		f.write_str(match *self {
 			SpecType::Foundation => "foundation",
-			SpecType::Morden => "morden",
-			SpecType::Ropsten => "ropsten",
-			SpecType::Olympic => "olympic",
-			SpecType::Classic => "classic",
-			SpecType::Expanse => "expanse",
+			SpecType::Poanet => "poanet",
+			SpecType::Xdai => "xdai",
+			SpecType::Volta => "volta",
+			SpecType::Ewc => "energyweb",
 			SpecType::Musicoin => "musicoin",
+			SpecType::Ellaism => "ellaism",
+			SpecType::Mix => "mix",
+			SpecType::Callisto => "callisto",
+			SpecType::EtherCore => "ethercore",
+			SpecType::Ropsten => "ropsten",
 			SpecType::Kovan => "kovan",
+			SpecType::Rinkeby => "rinkeby",
+			SpecType::Goerli => "goerli",
+			SpecType::YOLOv1 => "yolov1",
+			SpecType::Sokol => "sokol",
+			SpecType::Evantestcore => "evantestcore",
+			SpecType::Evancore => "evancore",
 			SpecType::Dev => "dev",
 			SpecType::Custom(ref custom) => custom,
 		})
@@ -87,26 +122,34 @@ impl SpecType {
 	pub fn spec<'a, T: Into<SpecParams<'a>>>(&self, params: T) -> Result<Spec, String> {
 		let params = params.into();
 		match *self {
-			SpecType::Foundation => Ok(ethereum::new_foundation(params)),
-			SpecType::Morden => Ok(ethereum::new_morden(params)),
-			SpecType::Ropsten => Ok(ethereum::new_ropsten(params)),
-			SpecType::Olympic => Ok(ethereum::new_olympic(params)),
-			SpecType::Classic => Ok(ethereum::new_classic(params)),
-			SpecType::Expanse => Ok(ethereum::new_expanse(params)),
-			SpecType::Musicoin => Ok(ethereum::new_musicoin(params)),
-			SpecType::Kovan => Ok(ethereum::new_kovan(params)),
-			SpecType::Dev => Ok(Spec::new_instant()),
+			SpecType::Foundation => Ok(spec::new_foundation(params)),
+			SpecType::Poanet => Ok(spec::new_poanet(params)),
+			SpecType::Xdai => Ok(spec::new_xdai(params)),
+			SpecType::Volta => Ok(spec::new_volta(params)),
+			SpecType::Ewc => Ok(spec::new_ewc(params)),
+			SpecType::Musicoin => Ok(spec::new_musicoin(params)),
+			SpecType::Ellaism => Ok(spec::new_ellaism(params)),
+			SpecType::Mix => Ok(spec::new_mix(params)),
+			SpecType::Callisto => Ok(spec::new_callisto(params)),
+			SpecType::EtherCore => Ok(spec::new_ethercore(params)),
+			SpecType::Ropsten => Ok(spec::new_ropsten(params)),
+			SpecType::Kovan => Ok(spec::new_kovan(params)),
+			SpecType::Rinkeby => Ok(spec::new_rinkeby(params)),
+			SpecType::Goerli => Ok(spec::new_goerli(params)),
+			SpecType::YOLOv1 => Ok(spec::new_yolov1(params)),
+			SpecType::Sokol => Ok(spec::new_sokol(params)),
+			SpecType::Evantestcore => Ok(spec::new_evantestcore(params)),
+			SpecType::Evancore => Ok(spec::new_evancore(params)),
+			SpecType::Dev => Ok(spec::new_instant()),
 			SpecType::Custom(ref filename) => {
 				let file = fs::File::open(filename).map_err(|e| format!("Could not load specification file at {}: {}", filename, e))?;
-				Spec::load(params, file)
+				Spec::load(params, file).map_err(|e| e.to_string())
 			}
 		}
 	}
 
 	pub fn legacy_fork_name(&self) -> Option<String> {
 		match *self {
-			SpecType::Classic => Some("classic".to_owned()),
-			SpecType::Expanse => Some("expanse".to_owned()),
 			SpecType::Musicoin => Some("musicoin".to_owned()),
 			_ => None,
 		}
@@ -184,10 +227,10 @@ impl str::FromStr for ResealPolicy {
 #[derive(Debug, PartialEq)]
 pub struct AccountsConfig {
 	pub iterations: u32,
+	pub refresh_time: u64,
 	pub testnet: bool,
 	pub password_files: Vec<String>,
 	pub unlocked_accounts: Vec<Address>,
-	pub enable_hardware_wallets: bool,
 	pub enable_fast_unlock: bool,
 }
 
@@ -195,10 +238,10 @@ impl Default for AccountsConfig {
 	fn default() -> Self {
 		AccountsConfig {
 			iterations: 10240,
+			refresh_time: 5,
 			testnet: false,
 			password_files: Vec::new(),
 			unlocked_accounts: Vec::new(),
-			enable_hardware_wallets: true,
 			enable_fast_unlock: false,
 		}
 	}
@@ -208,42 +251,37 @@ impl Default for AccountsConfig {
 pub enum GasPricerConfig {
 	Fixed(U256),
 	Calibrated {
-		initial_minimum: U256,
 		usd_per_tx: f32,
 		recalibration_period: Duration,
-	}
-}
-
-impl GasPricerConfig {
-	pub fn initial_min(&self) -> U256 {
-		match *self {
-			GasPricerConfig::Fixed(ref min) => min.clone(),
-			GasPricerConfig::Calibrated { ref initial_minimum, .. } => initial_minimum.clone(),
-		}
+		api_endpoint: String
 	}
 }
 
 impl Default for GasPricerConfig {
 	fn default() -> Self {
 		GasPricerConfig::Calibrated {
-			initial_minimum: 11904761856u64.into(),
-			usd_per_tx: 0.0025f32,
+			usd_per_tx: 0.0001f32,
 			recalibration_period: Duration::from_secs(3600),
+			api_endpoint: configuration::ETHERSCAN_ETH_PRICE_ENDPOINT.to_string(),
 		}
 	}
 }
 
 impl GasPricerConfig {
-	pub fn to_gas_pricer(&self, fetch: FetchClient) -> GasPricer {
+	pub fn to_gas_pricer(&self, fetch: FetchClient, p: Executor) -> GasPricer {
 		match *self {
 			GasPricerConfig::Fixed(u) => GasPricer::Fixed(u),
-			GasPricerConfig::Calibrated { usd_per_tx, recalibration_period, .. } => {
+			GasPricerConfig::Calibrated { usd_per_tx, recalibration_period, ref api_endpoint } => {
 				GasPricer::new_calibrated(
-					GasPriceCalibratorOptions {
-						usd_per_tx: usd_per_tx,
-						recalibration_period: recalibration_period,
-					},
-					fetch
+					GasPriceCalibrator::new(
+						GasPriceCalibratorOptions {
+							usd_per_tx: usd_per_tx,
+							recalibration_period: recalibration_period,
+						},
+						fetch,
+						p,
+						api_endpoint.clone(),
+					)
 				)
 			}
 		}
@@ -253,20 +291,22 @@ impl GasPricerConfig {
 #[derive(Debug, PartialEq)]
 pub struct MinerExtras {
 	pub author: Address,
-	pub extra_data: Vec<u8>,
-	pub gas_floor_target: U256,
-	pub gas_ceil_target: U256,
 	pub engine_signer: Address,
+	pub extra_data: Vec<u8>,
+	pub gas_range_target: (U256, U256),
+	pub work_notify: Vec<String>,
+	pub local_accounts: HashSet<Address>,
 }
 
 impl Default for MinerExtras {
 	fn default() -> Self {
 		MinerExtras {
 			author: Default::default(),
-			extra_data: version_data(),
-			gas_floor_target: U256::from(4_700_000),
-			gas_ceil_target: U256::from(6_283_184),
 			engine_signer: Default::default(),
+			extra_data: version_data(),
+			gas_range_target: (8_000_000.into(), 10_000_000.into()),
+			work_notify: Default::default(),
+			local_accounts: Default::default(),
 		}
 	}
 }
@@ -321,28 +361,44 @@ pub fn fatdb_switch_to_bool(switch: Switch, user_defaults: &UserDefaults, _algor
 }
 
 pub fn mode_switch_to_bool(switch: Option<Mode>, user_defaults: &UserDefaults) -> Result<Mode, String> {
-	Ok(switch.unwrap_or(user_defaults.mode.clone()))
+	Ok(switch.unwrap_or(user_defaults.mode().clone()))
 }
 
 #[cfg(test)]
 mod tests {
-	use util::journaldb::Algorithm;
+	use journaldb::Algorithm;
 	use user_defaults::UserDefaults;
 	use super::{SpecType, Pruning, ResealPolicy, Switch, tracing_switch_to_bool};
 
 	#[test]
 	fn test_spec_type_parsing() {
-		assert_eq!(SpecType::Foundation, "frontier".parse().unwrap());
-		assert_eq!(SpecType::Foundation, "homestead".parse().unwrap());
-		assert_eq!(SpecType::Foundation, "mainnet".parse().unwrap());
+		assert_eq!(SpecType::Foundation, "eth".parse().unwrap());
+		assert_eq!(SpecType::Foundation, "ethereum".parse().unwrap());
 		assert_eq!(SpecType::Foundation, "foundation".parse().unwrap());
-		assert_eq!(SpecType::Kovan, "testnet".parse().unwrap());
-		assert_eq!(SpecType::Kovan, "kovan".parse().unwrap());
-		assert_eq!(SpecType::Morden, "morden".parse().unwrap());
+		assert_eq!(SpecType::Foundation, "mainnet".parse().unwrap());
+		assert_eq!(SpecType::Poanet, "poanet".parse().unwrap());
+		assert_eq!(SpecType::Poanet, "poacore".parse().unwrap());
+		assert_eq!(SpecType::Xdai, "xdai".parse().unwrap());
+		assert_eq!(SpecType::Volta, "volta".parse().unwrap());
+		assert_eq!(SpecType::Ewc, "ewc".parse().unwrap());
+		assert_eq!(SpecType::Ewc, "energyweb".parse().unwrap());
+		assert_eq!(SpecType::Musicoin, "musicoin".parse().unwrap());
+		assert_eq!(SpecType::Ellaism, "ellaism".parse().unwrap());
+		assert_eq!(SpecType::Mix, "mix".parse().unwrap());
+		assert_eq!(SpecType::Callisto, "callisto".parse().unwrap());
+		assert_eq!(SpecType::EtherCore, "ethercore".parse().unwrap());
 		assert_eq!(SpecType::Ropsten, "ropsten".parse().unwrap());
-		assert_eq!(SpecType::Olympic, "olympic".parse().unwrap());
-		assert_eq!(SpecType::Classic, "classic".parse().unwrap());
-		assert_eq!(SpecType::Morden, "classic-testnet".parse().unwrap());
+		assert_eq!(SpecType::Kovan, "kovan".parse().unwrap());
+		assert_eq!(SpecType::Rinkeby, "rinkeby".parse().unwrap());
+		assert_eq!(SpecType::Goerli, "goerli".parse().unwrap());
+		assert_eq!(SpecType::Goerli, "görli".parse().unwrap());
+		assert_eq!(SpecType::Goerli, "testnet".parse().unwrap());
+		assert_eq!(SpecType::YOLOv1, "yolo".parse().unwrap());
+		assert_eq!(SpecType::YOLOv1, "yolov1".parse().unwrap());
+		assert_eq!(SpecType::Sokol, "sokol".parse().unwrap());
+		assert_eq!(SpecType::Sokol, "poasokol".parse().unwrap());
+		assert_eq!(SpecType::Evantestcore, "evantestcore".parse().unwrap());
+		assert_eq!(SpecType::Evancore, "evancore".parse().unwrap());
 	}
 
 	#[test]
@@ -353,13 +409,23 @@ mod tests {
 	#[test]
 	fn test_spec_type_display() {
 		assert_eq!(format!("{}", SpecType::Foundation), "foundation");
-		assert_eq!(format!("{}", SpecType::Ropsten), "ropsten");
-		assert_eq!(format!("{}", SpecType::Morden), "morden");
-		assert_eq!(format!("{}", SpecType::Olympic), "olympic");
-		assert_eq!(format!("{}", SpecType::Classic), "classic");
-		assert_eq!(format!("{}", SpecType::Expanse), "expanse");
+		assert_eq!(format!("{}", SpecType::Poanet), "poanet");
+		assert_eq!(format!("{}", SpecType::Xdai), "xdai");
+		assert_eq!(format!("{}", SpecType::Volta), "volta");
+		assert_eq!(format!("{}", SpecType::Ewc), "energyweb");
 		assert_eq!(format!("{}", SpecType::Musicoin), "musicoin");
+		assert_eq!(format!("{}", SpecType::Ellaism), "ellaism");
+		assert_eq!(format!("{}", SpecType::Mix), "mix");
+		assert_eq!(format!("{}", SpecType::Callisto), "callisto");
+		assert_eq!(format!("{}", SpecType::EtherCore), "ethercore");
+		assert_eq!(format!("{}", SpecType::Ropsten), "ropsten");
 		assert_eq!(format!("{}", SpecType::Kovan), "kovan");
+		assert_eq!(format!("{}", SpecType::Rinkeby), "rinkeby");
+		assert_eq!(format!("{}", SpecType::Goerli), "goerli");
+		assert_eq!(format!("{}", SpecType::YOLOv1), "yolov1");
+		assert_eq!(format!("{}", SpecType::Sokol), "sokol");
+		assert_eq!(format!("{}", SpecType::Evantestcore), "evantestcore");
+		assert_eq!(format!("{}", SpecType::Evancore), "evancore");
 		assert_eq!(format!("{}", SpecType::Dev), "dev");
 		assert_eq!(format!("{}", SpecType::Custom("foo/bar".into())), "foo/bar");
 	}

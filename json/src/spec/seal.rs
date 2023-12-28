@@ -1,37 +1,38 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Spec seal deserialization.
 
-use hash::*;
-use uint::Uint;
-use bytes::Bytes;
+use crate::{bytes::Bytes, hash::{H64, H256, H520}, uint::Uint};
+use serde::Deserialize;
 
 /// Ethereum seal.
 #[derive(Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Ethereum {
 	/// Seal nonce.
 	pub nonce: H64,
 	/// Seal mix hash.
-	#[serde(rename="mixHash")]
 	pub mix_hash: H256,
 }
 
 /// AuthorityRound seal.
 #[derive(Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityRoundSeal {
 	/// Seal step.
 	pub step: Uint,
@@ -41,6 +42,7 @@ pub struct AuthorityRoundSeal {
 
 /// Tendermint seal.
 #[derive(Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TendermintSeal {
 	/// Seal round.
 	pub round: Uint,
@@ -52,29 +54,24 @@ pub struct TendermintSeal {
 
 /// Seal variants.
 #[derive(Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub enum Seal {
 	/// Ethereum seal.
-	#[serde(rename="ethereum")]
 	Ethereum(Ethereum),
 	/// AuthorityRound seal.
-	#[serde(rename="authorityRound")]
 	AuthorityRound(AuthorityRoundSeal),
 	/// Tendermint seal.
-	#[serde(rename="tendermint")]
 	Tendermint(TendermintSeal),
 	/// Generic seal.
-	#[serde(rename="generic")]
 	Generic(Bytes),
 }
 
 #[cfg(test)]
 mod tests {
-	use serde_json;
-	use hash::*;
-	use bytes::Bytes;
-	use uint::Uint;
-	use bigint::prelude::{U256, H64 as Eth64, H256 as Eth256, H520 as Eth520};
-	use spec::{Ethereum, AuthorityRoundSeal, TendermintSeal, Seal};
+	use std::str::FromStr;
+	use super::{AuthorityRoundSeal, Bytes, Ethereum, H64, H256, H520, TendermintSeal, Seal, Uint};
+	use ethereum_types::{U256, H64 as Eth64, H256 as Eth256, H520 as Eth520};
 
 	#[test]
 	fn seal_deserialization() {
@@ -105,8 +102,8 @@ mod tests {
 
 		// [0]
 		assert_eq!(deserialized[0], Seal::Ethereum(Ethereum {
-			nonce: H64(Eth64::from("0x0000000000000042")),
-			mix_hash: H256(Eth256::from("0x1000000000000000000000000000000000000000000000000000000000000001"))
+			nonce: H64(Eth64::from_str("0000000000000042").unwrap()),
+			mix_hash: H256(Eth256::from_str("1000000000000000000000000000000000000000000000000000000000000001").unwrap())
 		}));
 
 		// [1]
@@ -117,14 +114,14 @@ mod tests {
 		// [2]
 		assert_eq!(deserialized[2], Seal::AuthorityRound(AuthorityRoundSeal {
 			step: Uint(U256::from(0x0)),
-			signature: H520(Eth520::from("0x2000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002"))
+			signature: H520(Eth520::from_str("2000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002").unwrap())
 		}));
 
 		// [3]
 		assert_eq!(deserialized[3], Seal::Tendermint(TendermintSeal {
 			round: Uint(U256::from(0x3)),
-			proposal: H520(Eth520::from("0x3000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003")),
-			precommits: vec![H520(Eth520::from("0x4000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004"))]
+			proposal: H520(Eth520::from_str("3000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003").unwrap()),
+			precommits: vec![H520(Eth520::from_str("4000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004").unwrap())]
 		}));
 	}
 }

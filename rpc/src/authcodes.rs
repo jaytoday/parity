@@ -1,28 +1,27 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::{fs, time, mem};
 
 use itertools::Itertools;
-use rand::Rng;
-use rand::os::OsRng;
+use rand::{Rng, rngs::OsRng, distributions::Alphanumeric};
 use hash::keccak;
-use bigint::hash::H256;
+use ethereum_types::H256;
 
 /// Providing current time in seconds
 pub trait TimeProvider {
@@ -50,10 +49,8 @@ impl TimeProvider for DefaultTimeProvider {
 const TIME_THRESHOLD: u64 = 7;
 /// minimal length of hash
 const TOKEN_LENGTH: usize = 16;
-/// special "initial" token used for authorization when there are no tokens yet.
-const INITIAL_TOKEN: &'static str = "initial";
 /// Separator between fields in serialized tokens file.
-const SEPARATOR: &'static str = ";";
+const SEPARATOR: &str = ";";
 /// Number of seconds to keep unused tokens.
 const UNUSED_TOKEN_TIMEOUT: u64 = 3600 * 24; // a day
 
@@ -83,7 +80,6 @@ pub struct AuthCodes<T: TimeProvider = DefaultTimeProvider> {
 impl AuthCodes<DefaultTimeProvider> {
 
 	/// Reads `AuthCodes` from file and creates new instance using `DefaultTimeProvider`.
-	#[cfg_attr(feature="dev", allow(single_char_pattern))]
 	pub fn from_file(file: &Path) -> io::Result<AuthCodes> {
 		let content = {
 			if let Ok(mut file) = fs::File::open(file) {
@@ -118,7 +114,7 @@ impl AuthCodes<DefaultTimeProvider> {
 			})
 			.collect();
 		Ok(AuthCodes {
-			codes: codes,
+			codes,
 			now: time_provider,
 		})
 	}
@@ -131,7 +127,7 @@ impl<T: TimeProvider> AuthCodes<T> {
 	pub fn to_file(&self, file: &Path) -> io::Result<()> {
 		let mut file = fs::File::create(file)?;
 		let content = self.codes.iter().map(|code| {
-			let mut data = vec![code.code.clone(), encode_time(code.created_at.clone())];
+			let mut data = vec![code.code.clone(), encode_time(code.created_at)];
 			if let Some(used_at) = code.last_used_at {
 				data.push(encode_time(used_at));
 			}
@@ -144,17 +140,16 @@ impl<T: TimeProvider> AuthCodes<T> {
 	pub fn new(codes: Vec<String>, now: T) -> Self {
 		AuthCodes {
 			codes: codes.into_iter().map(|code| Code {
-				code: code,
+				code,
 				created_at: time::Duration::from_secs(now.now()),
 				last_used_at: None,
 			}).collect(),
-			now: now,
+			now,
 		}
 	}
 
 	/// Checks if given hash is correct authcode of `SignerUI`
 	/// Updates this hash last used field in case it's valid.
-	#[cfg_attr(feature="dev", allow(wrong_self_convention))]
 	pub fn is_valid(&mut self, hash: &H256, time: u64) -> bool {
 		let now = self.now.now();
 		// check time
@@ -165,18 +160,8 @@ impl<T: TimeProvider> AuthCodes<T> {
 
 		let as_token = |code| keccak(format!("{}:{}", code, time));
 
-		// Check if it's the initial token.
-		if self.is_empty() {
-			let initial = &as_token(INITIAL_TOKEN) == hash;
-			// Initial token can be used only once.
-			if initial {
-				let _ = self.generate_new();
-			}
-			return initial;
-		}
-
 		// look for code
-		for mut code in &mut self.codes {
+		for code in &mut self.codes {
 			if &as_token(&code.code) == hash {
 				code.last_used_at = Some(time::Duration::from_secs(now));
 				return true;
@@ -188,8 +173,8 @@ impl<T: TimeProvider> AuthCodes<T> {
 
 	/// Generates and returns a new code that can be used by `SignerUIs`
 	pub fn generate_new(&mut self) -> io::Result<String> {
-		let mut rng = OsRng::new()?;
-		let code = rng.gen_ascii_chars().take(TOKEN_LENGTH).collect::<String>();
+		let rng = OsRng;
+		let code = rng.sample_iter(&Alphanumeric).take(TOKEN_LENGTH).collect::<String>();
 		let readable_code = code.as_bytes()
 			.chunks(4)
 			.filter_map(|f| String::from_utf8(f.to_vec()).ok())
@@ -197,7 +182,7 @@ impl<T: TimeProvider> AuthCodes<T> {
 			.join("-");
 		trace!(target: "signer", "New authentication token generated.");
 		self.codes.push(Code {
-			code: code,
+			code,
 			created_at: time::Duration::from_secs(self.now.now()),
 			last_used_at: None,
 		});
@@ -227,14 +212,13 @@ impl<T: TimeProvider> AuthCodes<T> {
 
 #[cfg(test)]
 mod tests {
-
-	use devtools;
 	use std::io::{Read, Write};
 	use std::{time, fs};
 	use std::cell::Cell;
+	use tempfile::TempDir;
 	use hash::keccak;
 
-	use bigint::hash::H256;
+	use ethereum_types::H256;
 	use super::*;
 
 	fn generate_hash(val: &str, time: u64) -> H256 {
@@ -242,7 +226,7 @@ mod tests {
 	}
 
 	#[test]
-	fn should_return_true_if_code_is_initial_and_store_is_empty() {
+	fn should_return_false_even_if_code_is_initial_and_store_is_empty() {
 		// given
 		let code = "initial";
 		let time = 99;
@@ -253,7 +237,7 @@ mod tests {
 		let res2 = codes.is_valid(&generate_hash(code, time), time);
 
 		// then
-		assert_eq!(res1, true);
+		assert_eq!(res1, false);
 		assert_eq!(res2, false);
 	}
 
@@ -305,15 +289,16 @@ mod tests {
 	#[test]
 	fn should_read_old_format_from_file() {
 		// given
-		let path = devtools::RandomTempPath::new();
+		let tempdir = TempDir::new().unwrap();
+		let file_path = tempdir.path().join("file");
 		let code = "23521352asdfasdfadf";
 		{
-			let mut file = fs::File::create(&path).unwrap();
+			let mut file = fs::File::create(&file_path).unwrap();
 			file.write_all(b"a\n23521352asdfasdfadf\nb\n").unwrap();
 		}
 
 		// when
-		let mut authcodes = AuthCodes::from_file(&path).unwrap();
+		let mut authcodes = AuthCodes::from_file(&file_path).unwrap();
 		let time = time::UNIX_EPOCH.elapsed().unwrap().as_secs();
 
 		// then
@@ -323,7 +308,8 @@ mod tests {
 	#[test]
 	fn should_remove_old_unused_tokens() {
 		// given
-		let path = devtools::RandomTempPath::new();
+		let tempdir = TempDir::new().unwrap();
+		let file_path = tempdir.path().join("file");
 		let code1 = "11111111asdfasdf111";
 		let code2 = "22222222asdfasdf222";
 		let code3 = "33333333asdfasdf333";
@@ -340,11 +326,11 @@ mod tests {
 
 		let new_code = codes.generate_new().unwrap().replace('-', "");
 		codes.clear_garbage();
-		codes.to_file(&path).unwrap();
+		codes.to_file(&file_path).unwrap();
 
 		// then
 		let mut content = String::new();
-		let mut file = fs::File::open(&path).unwrap();
+		let mut file = fs::File::open(&file_path).unwrap();
 		file.read_to_string(&mut content).unwrap();
 
 		assert_eq!(content, format!("{};100;10000100\n{};100;100\n{};10000100", code1, code2, new_code));

@@ -1,42 +1,43 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
+
+use std::sync::Arc;
 
 use serde::{Serialize, Serializer};
 use serde::ser::SerializeStruct;
-use ethcore::miner;
-use ethcore::{contract_address, CreateContractAddress};
-use ethcore::transaction::{LocalizedTransaction, Action, PendingTransaction, SignedTransaction};
-use v1::helpers::errors;
-use v1::types::{Bytes, H160, H256, U256, H512, U64, TransactionCondition};
+use machine::executive::{contract_address};
+use vm::CreateContractAddress;
+use ethereum_types::{H160, H256, H512, U64, U256};
+use miner;
+use types::transaction::{LocalizedTransaction, Action, PendingTransaction, SignedTransaction};
+use v1::types::{Bytes, TransactionCondition};
 
 /// Transaction
 #[derive(Debug, Default, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Transaction {
 	/// Hash
 	pub hash: H256,
 	/// Nonce
 	pub nonce: U256,
 	/// Block hash
-	#[serde(rename="blockHash")]
 	pub block_hash: Option<H256>,
 	/// Block number
-	#[serde(rename="blockNumber")]
 	pub block_number: Option<U256>,
 	/// Transaction Index
-	#[serde(rename="transactionIndex")]
 	pub transaction_index: Option<U256>,
 	/// Sender
 	pub from: H160,
@@ -45,7 +46,6 @@ pub struct Transaction {
 	/// Transfered value
 	pub value: U256,
 	/// Gas Price
-	#[serde(rename="gasPrice")]
 	pub gas_price: U256,
 	/// Gas
 	pub gas: U256,
@@ -56,13 +56,10 @@ pub struct Transaction {
 	/// Raw transaction data
 	pub raw: Bytes,
 	/// Public key of the signer.
-	#[serde(rename="publicKey")]
 	pub public_key: Option<H512>,
 	/// The network id of the transaction, if any.
-	#[serde(rename="chainId")]
 	pub chain_id: Option<U64>,
 	/// The standardised V field of the signature (0 or 1).
-	#[serde(rename="standardV")]
 	pub standard_v: U256,
 	/// The standardised V field of the signature.
 	pub v: U256,
@@ -81,8 +78,10 @@ pub enum LocalTransactionStatus {
 	Pending,
 	/// Transaction is in future part of the queue
 	Future,
-	/// Transaction is already mined.
+	/// Transaction was mined.
 	Mined(Transaction),
+	/// Transaction was removed from the queue, but not mined.
+	Culled(Transaction),
 	/// Transaction was dropped because of limit.
 	Dropped(Transaction),
 	/// Transaction was replaced by transaction with higher gas price.
@@ -103,7 +102,7 @@ impl Serialize for LocalTransactionStatus {
 
 		let elems = match *self {
 			Pending | Future => 1,
-			Mined(..) | Dropped(..) | Invalid(..) | Canceled(..) => 2,
+			Mined(..) | Culled(..) | Dropped(..) | Invalid(..) | Canceled(..) => 2,
 			Rejected(..) => 3,
 			Replaced(..) => 4,
 		};
@@ -117,6 +116,10 @@ impl Serialize for LocalTransactionStatus {
 			Future => struc.serialize_field(status, "future")?,
 			Mined(ref tx) => {
 				struc.serialize_field(status, "mined")?;
+				struc.serialize_field(transaction, tx)?;
+			},
+			Culled(ref tx) => {
+				struc.serialize_field(status, "culled")?;
 				struc.serialize_field(transaction, tx)?;
 			},
 			Dropped(ref tx) => {
@@ -154,15 +157,14 @@ pub struct RichRawTransaction {
 	/// Raw transaction RLP
 	pub raw: Bytes,
 	/// Transaction details
-	#[serde(rename="tx")]
+	#[serde(rename = "tx")]
 	pub transaction: Transaction
 }
 
-
-impl From<SignedTransaction> for RichRawTransaction {
-	fn from(t: SignedTransaction) -> Self {
-		// TODO: change transition to 0 when EIP-86 is commonly used.
-		let tx: Transaction = Transaction::from_signed(t, 0, u64::max_value());
+impl RichRawTransaction {
+	/// Creates new `RichRawTransaction` from `SignedTransaction`.
+	pub fn from_signed(tx: SignedTransaction) -> Self {
+		let tx = Transaction::from_signed(tx);
 		RichRawTransaction {
 			raw: tx.raw.clone(),
 			transaction: tx,
@@ -172,29 +174,29 @@ impl From<SignedTransaction> for RichRawTransaction {
 
 impl Transaction {
 	/// Convert `LocalizedTransaction` into RPC Transaction.
-	pub fn from_localized(mut t: LocalizedTransaction, eip86_transition: u64) -> Transaction {
+	pub fn from_localized(mut t: LocalizedTransaction) -> Transaction {
 		let signature = t.signature();
-		let scheme = if t.block_number >= eip86_transition { CreateContractAddress::FromCodeHash } else { CreateContractAddress::FromSenderAndNonce };
+		let scheme = CreateContractAddress::FromSenderAndNonce;
 		Transaction {
-			hash: t.hash().into(),
-			nonce: t.nonce.into(),
-			block_hash: Some(t.block_hash.clone().into()),
+			hash: t.hash(),
+			nonce: t.nonce,
+			block_hash: Some(t.block_hash),
 			block_number: Some(t.block_number.into()),
 			transaction_index: Some(t.transaction_index.into()),
-			from: t.sender().into(),
+			from: t.sender(),
 			to: match t.action {
 				Action::Create => None,
-				Action::Call(ref address) => Some(address.clone().into())
+				Action::Call(ref address) => Some(*address)
 			},
-			value: t.value.into(),
-			gas_price: t.gas_price.into(),
-			gas: t.gas.into(),
+			value: t.value,
+			gas_price: t.gas_price,
+			gas: t.gas,
 			input: Bytes::new(t.data.clone()),
 			creates: match t.action {
-				Action::Create => Some(contract_address(scheme, &t.sender(), &t.nonce, &t.data).0.into()),
+				Action::Create => Some(contract_address(scheme, &t.sender(), &t.nonce, &t.data).0),
 				Action::Call(_) => None,
 			},
-			raw: ::rlp::encode(&t.signed).into_vec().into(),
+			raw: ::rlp::encode(&t.signed).into(),
 			public_key: t.recover_public().ok().map(Into::into),
 			chain_id: t.chain_id().map(U64::from),
 			standard_v: t.standard_v().into(),
@@ -206,29 +208,29 @@ impl Transaction {
 	}
 
 	/// Convert `SignedTransaction` into RPC Transaction.
-	pub fn from_signed(t: SignedTransaction, block_number: u64, eip86_transition: u64) -> Transaction {
+	pub fn from_signed(t: SignedTransaction) -> Transaction {
 		let signature = t.signature();
-		let scheme = if block_number >= eip86_transition { CreateContractAddress::FromCodeHash } else { CreateContractAddress::FromSenderAndNonce };
+		let scheme = CreateContractAddress::FromSenderAndNonce;
 		Transaction {
-			hash: t.hash().into(),
-			nonce: t.nonce.into(),
+			hash: t.hash(),
+			nonce: t.nonce,
 			block_hash: None,
-			block_number: Some(block_number.into()),
+			block_number: None,
 			transaction_index: None,
-			from: t.sender().into(),
+			from: t.sender(),
 			to: match t.action {
 				Action::Create => None,
-				Action::Call(ref address) => Some(address.clone().into())
+				Action::Call(ref address) => Some(*address)
 			},
-			value: t.value.into(),
-			gas_price: t.gas_price.into(),
-			gas: t.gas.into(),
+			value: t.value,
+			gas_price: t.gas_price,
+			gas: t.gas,
 			input: Bytes::new(t.data.clone()),
 			creates: match t.action {
-				Action::Create => Some(contract_address(scheme, &t.sender(), &t.nonce, &t.data).0.into()),
+				Action::Create => Some(contract_address(scheme, &t.sender(), &t.nonce, &t.data).0),
 				Action::Call(_) => None,
 			},
-			raw: ::rlp::encode(&t).into_vec().into(),
+			raw: ::rlp::encode(&t).into(),
 			public_key: t.public_key().map(Into::into),
 			chain_id: t.chain_id().map(U64::from),
 			standard_v: t.standard_v().into(),
@@ -240,26 +242,33 @@ impl Transaction {
 	}
 
 	/// Convert `PendingTransaction` into RPC Transaction.
-	pub fn from_pending(t: PendingTransaction, block_number: u64, eip86_transition: u64) -> Transaction {
-		let mut r = Transaction::from_signed(t.transaction, block_number, eip86_transition);
-		r.condition = t.condition.map(|b| b.into());
+	pub fn from_pending(t: PendingTransaction) -> Transaction {
+		let mut r = Transaction::from_signed(t.transaction);
+		r.condition = r.condition.map(Into::into);
 		r
 	}
 }
 
 impl LocalTransactionStatus {
 	/// Convert `LocalTransactionStatus` into RPC `LocalTransactionStatus`.
-	pub fn from(s: miner::LocalTransactionStatus, block_number: u64, eip86_transition: u64) -> Self {
-		use ethcore::miner::LocalTransactionStatus::*;
+	pub fn from(s: miner::pool::local_transactions::Status) -> Self {
+		let convert = |tx: Arc<miner::pool::VerifiedTransaction>| {
+			Transaction::from_signed(tx.signed().clone())
+		};
+		use miner::pool::local_transactions::Status::*;
 		match s {
-			Pending => LocalTransactionStatus::Pending,
-			Future => LocalTransactionStatus::Future,
-			Mined(tx) => LocalTransactionStatus::Mined(Transaction::from_signed(tx, block_number, eip86_transition)),
-			Dropped(tx) => LocalTransactionStatus::Dropped(Transaction::from_signed(tx, block_number, eip86_transition)),
-			Rejected(tx, err) => LocalTransactionStatus::Rejected(Transaction::from_signed(tx, block_number, eip86_transition), errors::transaction_message(err)),
-			Replaced(tx, gas_price, hash) => LocalTransactionStatus::Replaced(Transaction::from_signed(tx, block_number, eip86_transition), gas_price.into(), hash.into()),
-			Invalid(tx) => LocalTransactionStatus::Invalid(Transaction::from_signed(tx, block_number, eip86_transition)),
-			Canceled(tx) => LocalTransactionStatus::Canceled(Transaction::from_pending(tx, block_number, eip86_transition)),
+			Pending(_) => LocalTransactionStatus::Pending,
+			Mined(tx) => LocalTransactionStatus::Mined(convert(tx)),
+			Culled(tx) => LocalTransactionStatus::Culled(convert(tx)),
+			Dropped(tx) => LocalTransactionStatus::Dropped(convert(tx)),
+			Rejected(tx, reason) => LocalTransactionStatus::Rejected(convert(tx), reason),
+			Invalid(tx) => LocalTransactionStatus::Invalid(convert(tx)),
+			Canceled(tx) => LocalTransactionStatus::Canceled(convert(tx)),
+			Replaced { old, new } => LocalTransactionStatus::Replaced(
+				convert(old),
+				new.signed().gas_price,
+				new.signed().hash(),
+			),
 		}
 	}
 }
@@ -278,6 +287,8 @@ mod tests {
 
 	#[test]
 	fn test_local_transaction_status_serialize() {
+		use ethereum_types::H256;
+
 		let tx_ser = serde_json::to_string(&Transaction::default()).unwrap();
 		let status1 = LocalTransactionStatus::Pending;
 		let status2 = LocalTransactionStatus::Future;
@@ -285,7 +296,7 @@ mod tests {
 		let status4 = LocalTransactionStatus::Dropped(Transaction::default());
 		let status5 = LocalTransactionStatus::Invalid(Transaction::default());
 		let status6 = LocalTransactionStatus::Rejected(Transaction::default(), "Just because".into());
-		let status7 = LocalTransactionStatus::Replaced(Transaction::default(), 5.into(), 10.into());
+		let status7 = LocalTransactionStatus::Replaced(Transaction::default(), 5.into(), H256::from_low_u64_be(10));
 
 		assert_eq!(
 			serde_json::to_string(&status1).unwrap(),
@@ -321,4 +332,3 @@ mod tests {
 		);
 	}
 }
-

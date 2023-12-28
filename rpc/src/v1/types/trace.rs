@@ -1,29 +1,31 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::BTreeMap;
-use serde::{Serialize, Serializer};
+
+use machine::executed::Executed;
+use trace as et;
+use trace::{FlatTrace, LocalizedTrace as EthLocalizedTrace, trace, TraceError};
+use ethereum_types::{H160, H256, U256};
 use serde::ser::SerializeStruct;
-use ethcore::trace::{FlatTrace, LocalizedTrace as EthLocalizedTrace, trace, TraceError};
-use ethcore::trace as et;
-use ethcore::state_diff;
-use ethcore::account_diff;
-use ethcore::client::Executed;
-use vm;
-use v1::types::{Bytes, H160, H256, U256};
+use serde::{Serialize, Serializer};
+use types::account_diff;
+use types::state_diff;
+
+use v1::types::Bytes;
 
 #[derive(Debug, Serialize)]
 /// A diff of some chunk of memory.
@@ -55,8 +57,8 @@ pub struct StorageDiff {
 impl From<et::StorageDiff> for StorageDiff {
 	fn from(c: et::StorageDiff) -> Self {
 		StorageDiff {
-			key: c.location.into(),
-			val: c.value.into(),
+			key: c.location,
+			val: c.value,
 		}
 	}
 }
@@ -65,15 +67,12 @@ impl From<et::StorageDiff> for StorageDiff {
 /// A record of an executed VM operation.
 pub struct VMExecutedOperation {
 	/// The total gas used.
-	#[serde(rename="used")]
 	pub used: u64,
 	/// The stack item placed, if any.
 	pub push: Vec<U256>,
 	/// If altered, the memory delta.
-	#[serde(rename="mem")]
 	pub mem: Option<MemoryDiff>,
 	/// The altered storage value, if any.
-	#[serde(rename="store")]
 	pub store: Option<StorageDiff>,
 }
 
@@ -154,17 +153,17 @@ pub struct ChangedType<T> where T: Serialize {
 #[derive(Debug, Serialize)]
 /// Serde-friendly `Diff` shadow.
 pub enum Diff<T> where T: Serialize {
-	#[serde(rename="=")]
+	#[serde(rename = "=")]
 	Same,
-	#[serde(rename="+")]
+	#[serde(rename = "+")]
 	Born(T),
-	#[serde(rename="-")]
+	#[serde(rename = "-")]
 	Died(T),
-	#[serde(rename="*")]
+	#[serde(rename = "*")]
 	Changed(ChangedType<T>),
 }
 
-impl<T, U> From<account_diff::Diff<T>> for Diff<U> where T: Eq + ::ethcore_ipc::BinaryConvertable, U: Serialize + From<T> {
+impl<T, U> From<account_diff::Diff<T>> for Diff<U> where T: Eq, U: Serialize + From<T> {
 	fn from(c: account_diff::Diff<T>) -> Self {
 		match c {
 			account_diff::Diff::Same => Diff::Same,
@@ -190,7 +189,7 @@ impl From<account_diff::AccountDiff> for AccountDiff {
 			balance: c.balance.into(),
 			nonce: c.nonce.into(),
 			code: c.code.into(),
-			storage: c.storage.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
+			storage: c.storage.into_iter().map(|(k, v)| (k, v.into())).collect(),
 		}
 	}
 }
@@ -208,12 +207,13 @@ impl Serialize for StateDiff {
 
 impl From<state_diff::StateDiff> for StateDiff {
 	fn from(c: state_diff::StateDiff) -> Self {
-		StateDiff(c.raw.into_iter().map(|(k, v)| (k.into(), v.into())).collect())
+		StateDiff(c.raw.into_iter().map(|(k, v)| (k, v.into())).collect())
 	}
 }
 
 /// Create response
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Create {
 	/// Sender
 	from: H160,
@@ -223,53 +223,70 @@ pub struct Create {
 	gas: U256,
 	/// Initialization code
 	init: Bytes,
+	// Create Type
+	#[serde(skip_serializing_if="Option::is_none")]
+	creation_method: Option<CreationMethod>,
 }
 
 impl From<trace::Create> for Create {
 	fn from(c: trace::Create) -> Self {
 		Create {
-			from: c.from.into(),
-			value: c.value.into(),
-			gas: c.gas.into(),
+			from: c.from,
+			value: c.value,
+			gas: c.gas,
 			init: Bytes::new(c.init),
+			creation_method: c.creation_method.map(|c| c.into()),
 		}
 	}
 }
 
 /// Call type.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CallType {
-	/// None
-	#[serde(rename="none")]
-	None,
 	/// Call
-	#[serde(rename="call")]
 	Call,
 	/// Call code
-	#[serde(rename="callcode")]
 	CallCode,
 	/// Delegate call
-	#[serde(rename="delegatecall")]
 	DelegateCall,
 	/// Static call
-	#[serde(rename="staticcall")]
 	StaticCall,
 }
 
-impl From<vm::CallType> for CallType {
-	fn from(c: vm::CallType) -> Self {
+impl From<trace::CallType> for CallType {
+	fn from(c: trace::CallType) -> Self {
 		match c {
-			vm::CallType::None => CallType::None,
-			vm::CallType::Call => CallType::Call,
-			vm::CallType::CallCode => CallType::CallCode,
-			vm::CallType::DelegateCall => CallType::DelegateCall,
-			vm::CallType::StaticCall => CallType::StaticCall,
+			trace::CallType::Call => CallType::Call,
+			trace::CallType::CallCode => CallType::CallCode,
+			trace::CallType::DelegateCall => CallType::DelegateCall,
+			trace::CallType::StaticCall => CallType::StaticCall,
+		}
+	}
+}
+
+/// Create type.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CreationMethod {
+	/// Create
+	Create,
+	/// Create2
+	Create2,
+}
+
+impl From<trace::CreationMethod> for CreationMethod {
+	fn from(c: trace::CreationMethod) -> Self {
+		match c {
+			trace::CreationMethod::Create => CreationMethod::Create,
+			trace::CreationMethod::Create2 => CreationMethod::Create2,
 		}
 	}
 }
 
 /// Call response
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Call {
 	/// Sender
 	from: H160,
@@ -282,32 +299,35 @@ pub struct Call {
 	/// Input data
 	input: Bytes,
 	/// The type of the call.
-	#[serde(rename="callType")]
-	call_type: CallType,
+	call_type: Option<CallType>,
 }
 
 impl From<trace::Call> for Call {
 	fn from(c: trace::Call) -> Self {
+		let optional: Option<trace::CallType> = c.call_type.0;
 		Call {
-			from: c.from.into(),
-			to: c.to.into(),
-			value: c.value.into(),
-			gas: c.gas.into(),
+			from: c.from,
+			to: c.to,
+			value: c.value,
+			gas: c.gas,
 			input: c.input.into(),
-			call_type: c.call_type.into(),
+			call_type: optional.map(|c| c.into()),
 		}
 	}
 }
 
 /// Reward type.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum RewardType {
 	/// Block
-	#[serde(rename="block")]
 	Block,
 	/// Uncle
-	#[serde(rename="uncle")]
 	Uncle,
+	/// EmptyStep (AuthorityRound)
+	EmptyStep,
+	/// External (attributed as part of an external protocol)
+	External,
 }
 
 impl From<trace::RewardType> for RewardType {
@@ -315,28 +335,29 @@ impl From<trace::RewardType> for RewardType {
 		match c {
 			trace::RewardType::Block => RewardType::Block,
 			trace::RewardType::Uncle => RewardType::Uncle,
+			trace::RewardType::EmptyStep => RewardType::EmptyStep,
+			trace::RewardType::External => RewardType::External,
 		}
 	}
 }
 
-
 /// Reward action
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Reward {
 	/// Author's address.
 	pub author: H160,
 	/// Reward amount.
 	pub value: U256,
 	/// Reward type.
-	#[serde(rename="rewardType")]
 	pub reward_type: RewardType,
 }
 
 impl From<trace::Reward> for Reward {
 	fn from(r: trace::Reward) -> Self {
 		Reward {
-			author: r.author.into(),
-			value: r.value.into(),
+			author: r.author,
+			value: r.value,
 			reward_type: r.reward_type.into(),
 		}
 	}
@@ -344,11 +365,11 @@ impl From<trace::Reward> for Reward {
 
 /// Suicide
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Suicide {
 	/// Address.
 	pub address: H160,
 	/// Refund address.
-	#[serde(rename="refundAddress")]
 	pub refund_address: H160,
 	/// Balance.
 	pub balance: U256,
@@ -357,9 +378,9 @@ pub struct Suicide {
 impl From<trace::Suicide> for Suicide {
 	fn from(s: trace::Suicide) -> Self {
 		Suicide {
-			address: s.address.into(),
-			refund_address: s.refund_address.into(),
-			balance: s.balance.into(),
+			address: s.address,
+			refund_address: s.refund_address,
+			balance: s.balance,
 		}
 	}
 }
@@ -374,7 +395,7 @@ pub enum Action {
 	/// Suicide
 	Suicide(Suicide),
 	/// Reward
-	Reward(Reward),	
+	Reward(Reward),
 }
 
 impl From<trace::Action> for Action {
@@ -390,9 +411,9 @@ impl From<trace::Action> for Action {
 
 /// Call Result
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CallResult {
 	/// Gas used
-	#[serde(rename="gasUsed")]
 	gas_used: U256,
 	/// Output bytes
 	output: Bytes,
@@ -401,7 +422,7 @@ pub struct CallResult {
 impl From<trace::CallResult> for CallResult {
 	fn from(c: trace::CallResult) -> Self {
 		CallResult {
-			gas_used: c.gas_used.into(),
+			gas_used: c.gas_used,
 			output: c.output.into(),
 		}
 	}
@@ -409,9 +430,9 @@ impl From<trace::CallResult> for CallResult {
 
 /// Craete Result
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateResult {
 	/// Gas used
-	#[serde(rename="gasUsed")]
 	gas_used: U256,
 	/// Code
 	code: Bytes,
@@ -422,9 +443,9 @@ pub struct CreateResult {
 impl From<trace::CreateResult> for CreateResult {
 	fn from(c: trace::CreateResult) -> Self {
 		CreateResult {
-			gas_used: c.gas_used.into(),
+			gas_used: c.gas_used,
 			code: c.code.into(),
-			address: c.address.into(),
+			address: c.address,
 		}
 	}
 }
@@ -526,11 +547,11 @@ impl From<EthLocalizedTrace> for LocalizedTrace {
 			action: t.action.into(),
 			result: t.result.into(),
 			trace_address: t.trace_address.into_iter().map(Into::into).collect(),
-			subtraces: t.subtraces.into(),
+			subtraces: t.subtraces,
 			transaction_position: t.transaction_number.map(Into::into),
 			transaction_hash: t.transaction_hash.map(Into::into),
-			block_number: t.block_number.into(),
-			block_hash: t.block_hash.into(),
+			block_number: t.block_number,
+			block_hash: t.block_hash,
 		}
 	}
 }
@@ -591,7 +612,7 @@ impl From<FlatTrace> for Trace {
 	fn from(t: FlatTrace) -> Self {
 		Trace {
 			trace_address: t.trace_address.into_iter().map(Into::into).collect(),
-			subtraces: t.subtraces.into(),
+			subtraces: t.subtraces,
 			action: t.action.into(),
 			result: t.result.into(),
 		}
@@ -599,6 +620,7 @@ impl From<FlatTrace> for Trace {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 /// A diff of some chunk of memory.
 pub struct TraceResults {
 	/// The output of the call/create
@@ -606,10 +628,8 @@ pub struct TraceResults {
 	/// The transaction trace.
 	pub trace: Vec<Trace>,
 	/// The transaction trace.
-	#[serde(rename="vmTrace")]
 	pub vm_trace: Option<VMTrace>,
 	/// The transaction trace.
-	#[serde(rename="stateDiff")]
 	pub state_diff: Option<StateDiff>,
 }
 
@@ -624,12 +644,39 @@ impl From<Executed> for TraceResults {
 	}
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// A diff of some chunk of memory.
+pub struct TraceResultsWithTransactionHash {
+	/// The output of the call/create
+	pub output: Bytes,
+	/// The transaction trace.
+	pub trace: Vec<Trace>,
+	/// The transaction trace.
+	pub vm_trace: Option<VMTrace>,
+	/// The transaction trace.
+	pub state_diff: Option<StateDiff>,
+	/// The transaction Hash.
+	pub transaction_hash: H256,
+}
+
+impl From<(H256, Executed)> for TraceResultsWithTransactionHash {
+	fn from(t: (H256, Executed)) -> Self {
+		TraceResultsWithTransactionHash {
+			output: t.1.output.into(),
+			trace: t.1.trace.into_iter().map(Into::into).collect(),
+			vm_trace: t.1.vm_trace.map(Into::into),
+			state_diff: t.1.state_diff.map(Into::into),
+			transaction_hash: t.0,
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
-	use serde_json;
-	use std::collections::BTreeMap;
 	use v1::types::Bytes;
-	use ethcore::trace::TraceError;
+	use trace::TraceError;
+	use ethereum_types::Address;
 	use super::*;
 
 	#[test]
@@ -648,12 +695,12 @@ mod tests {
 	fn test_trace_call_serialize() {
 		let t = LocalizedTrace {
 			action: Action::Call(Call {
-				from: 4.into(),
-				to: 5.into(),
+				from: Address::from_low_u64_be(4),
+				to: Address::from_low_u64_be(5),
 				value: 6.into(),
 				gas: 7.into(),
 				input: Bytes::new(vec![0x12, 0x34]),
-				call_type: CallType::Call,
+				call_type: Some(CallType::Call),
 			}),
 			result: Res::Call(CallResult {
 				gas_used: 8.into(),
@@ -662,9 +709,9 @@ mod tests {
 			trace_address: vec![10],
 			subtraces: 1,
 			transaction_position: Some(11),
-			transaction_hash: Some(12.into()),
+			transaction_hash: Some(H256::from_low_u64_be(12)),
 			block_number: 13,
-			block_hash: 14.into(),
+			block_hash: H256::from_low_u64_be(14),
 		};
 		let serialized = serde_json::to_string(&t).unwrap();
 		assert_eq!(serialized, r#"{"type":"call","action":{"from":"0x0000000000000000000000000000000000000004","to":"0x0000000000000000000000000000000000000005","value":"0x6","gas":"0x7","input":"0x1234","callType":"call"},"result":{"gasUsed":"0x8","output":"0x5678"},"traceAddress":[10],"subtraces":1,"transactionPosition":11,"transactionHash":"0x000000000000000000000000000000000000000000000000000000000000000c","blockNumber":13,"blockHash":"0x000000000000000000000000000000000000000000000000000000000000000e"}"#);
@@ -674,20 +721,20 @@ mod tests {
 	fn test_trace_failed_call_serialize() {
 		let t = LocalizedTrace {
 			action: Action::Call(Call {
-				from: 4.into(),
-				to: 5.into(),
+				from: Address::from_low_u64_be(4),
+				to: Address::from_low_u64_be(5),
 				value: 6.into(),
 				gas: 7.into(),
 				input: Bytes::new(vec![0x12, 0x34]),
-				call_type: CallType::Call,
+				call_type: Some(CallType::Call),
 			}),
 			result: Res::FailedCall(TraceError::OutOfGas),
 			trace_address: vec![10],
 			subtraces: 1,
 			transaction_position: Some(11),
-			transaction_hash: Some(12.into()),
+			transaction_hash: Some(H256::from_low_u64_be(12)),
 			block_number: 13,
-			block_hash: 14.into(),
+			block_hash: H256::from_low_u64_be(14),
 		};
 		let serialized = serde_json::to_string(&t).unwrap();
 		assert_eq!(serialized, r#"{"type":"call","action":{"from":"0x0000000000000000000000000000000000000004","to":"0x0000000000000000000000000000000000000005","value":"0x6","gas":"0x7","input":"0x1234","callType":"call"},"error":"Out of gas","traceAddress":[10],"subtraces":1,"transactionPosition":11,"transactionHash":"0x000000000000000000000000000000000000000000000000000000000000000c","blockNumber":13,"blockHash":"0x000000000000000000000000000000000000000000000000000000000000000e"}"#);
@@ -697,63 +744,65 @@ mod tests {
 	fn test_trace_create_serialize() {
 		let t = LocalizedTrace {
 			action: Action::Create(Create {
-				from: 4.into(),
+				from: Address::from_low_u64_be(4),
 				value: 6.into(),
 				gas: 7.into(),
 				init: Bytes::new(vec![0x12, 0x34]),
+				creation_method: Some(CreationMethod::Create).into(),
 			}),
 			result: Res::Create(CreateResult {
 				gas_used: 8.into(),
 				code: vec![0x56, 0x78].into(),
-				address: 0xff.into(),
+				address: Address::from_low_u64_be(0xff),
 			}),
 			trace_address: vec![10],
 			subtraces: 1,
 			transaction_position: Some(11),
-			transaction_hash: Some(12.into()),
+			transaction_hash: Some(H256::from_low_u64_be(12)),
 			block_number: 13,
-			block_hash: 14.into(),
+			block_hash: H256::from_low_u64_be(14),
 		};
 		let serialized = serde_json::to_string(&t).unwrap();
-		assert_eq!(serialized, r#"{"type":"create","action":{"from":"0x0000000000000000000000000000000000000004","value":"0x6","gas":"0x7","init":"0x1234"},"result":{"gasUsed":"0x8","code":"0x5678","address":"0x00000000000000000000000000000000000000ff"},"traceAddress":[10],"subtraces":1,"transactionPosition":11,"transactionHash":"0x000000000000000000000000000000000000000000000000000000000000000c","blockNumber":13,"blockHash":"0x000000000000000000000000000000000000000000000000000000000000000e"}"#);
+		assert_eq!(serialized, r#"{"type":"create","action":{"from":"0x0000000000000000000000000000000000000004","value":"0x6","gas":"0x7","init":"0x1234","creationMethod":"create"},"result":{"gasUsed":"0x8","code":"0x5678","address":"0x00000000000000000000000000000000000000ff"},"traceAddress":[10],"subtraces":1,"transactionPosition":11,"transactionHash":"0x000000000000000000000000000000000000000000000000000000000000000c","blockNumber":13,"blockHash":"0x000000000000000000000000000000000000000000000000000000000000000e"}"#);
 	}
 
 	#[test]
 	fn test_trace_failed_create_serialize() {
 		let t = LocalizedTrace {
 			action: Action::Create(Create {
-				from: 4.into(),
+				from: Address::from_low_u64_be(4),
 				value: 6.into(),
 				gas: 7.into(),
 				init: Bytes::new(vec![0x12, 0x34]),
+				creation_method: Some(CreationMethod::Create).into(),
 			}),
 			result: Res::FailedCreate(TraceError::OutOfGas),
 			trace_address: vec![10],
 			subtraces: 1,
 			transaction_position: Some(11),
-			transaction_hash: Some(12.into()),
+			transaction_hash: Some(H256::from_low_u64_be(12)),
 			block_number: 13,
-			block_hash: 14.into(),
+			block_hash: H256::from_low_u64_be(14),
 		};
 		let serialized = serde_json::to_string(&t).unwrap();
-		assert_eq!(serialized, r#"{"type":"create","action":{"from":"0x0000000000000000000000000000000000000004","value":"0x6","gas":"0x7","init":"0x1234"},"error":"Out of gas","traceAddress":[10],"subtraces":1,"transactionPosition":11,"transactionHash":"0x000000000000000000000000000000000000000000000000000000000000000c","blockNumber":13,"blockHash":"0x000000000000000000000000000000000000000000000000000000000000000e"}"#);
+		assert_eq!(serialized, r#"{"type":"create","action":{"from":"0x0000000000000000000000000000000000000004","value":"0x6","gas":"0x7","init":"0x1234","creationMethod":"create"},"error":"Out of gas","traceAddress":[10],"subtraces":1,"transactionPosition":11,"transactionHash":"0x000000000000000000000000000000000000000000000000000000000000000c","blockNumber":13,"blockHash":"0x000000000000000000000000000000000000000000000000000000000000000e"}"#);
 	}
 
 	#[test]
 	fn test_trace_suicide_serialize() {
 		let t = LocalizedTrace {
 			action: Action::Suicide(Suicide {
-				address: 4.into(),
-				refund_address: 6.into(),
+				address: Address::from_low_u64_be(4),
+				refund_address: Address::from_low_u64_be(6),
 				balance: 7.into(),
 			}),
 			result: Res::None,
 			trace_address: vec![10],
 			subtraces: 1,
 			transaction_position: Some(11),
-			transaction_hash: Some(12.into()),
+			transaction_hash: Some(H256::from_low_u64_be(12)),
 			block_number: 13,
-			block_hash: 14.into(),
+			block_hash: H256::from_low_u64_be(14),
 		};
 		let serialized = serde_json::to_string(&t).unwrap();
 		assert_eq!(serialized, r#"{"type":"suicide","action":{"address":"0x0000000000000000000000000000000000000004","refundAddress":"0x0000000000000000000000000000000000000006","balance":"0x7"},"result":null,"traceAddress":[10],"subtraces":1,"transactionPosition":11,"transactionHash":"0x000000000000000000000000000000000000000000000000000000000000000c","blockNumber":13,"blockHash":"0x000000000000000000000000000000000000000000000000000000000000000e"}"#);
@@ -763,7 +812,7 @@ mod tests {
 	fn test_trace_reward_serialize() {
 		let t = LocalizedTrace {
 			action: Action::Reward(Reward {
-				author: 4.into(),
+				author: Address::from_low_u64_be(4),
 				value: 6.into(),
 				reward_type: RewardType::Block,
 			}),
@@ -773,7 +822,7 @@ mod tests {
 			transaction_position: None,
 			transaction_hash: None,
 			block_number: 13,
-			block_hash: 14.into(),
+			block_hash: H256::from_low_u64_be(14),
 		};
 		let serialized = serde_json::to_string(&t).unwrap();
 		assert_eq!(serialized, r#"{"type":"reward","action":{"author":"0x0000000000000000000000000000000000000004","value":"0x6","rewardType":"block"},"result":null,"traceAddress":[10],"subtraces":1,"transactionPosition":null,"transactionHash":null,"blockNumber":13,"blockHash":"0x000000000000000000000000000000000000000000000000000000000000000e"}"#);
@@ -824,20 +873,20 @@ mod tests {
 
 	#[test]
 	fn test_statediff_serialize() {
-		let t = StateDiff(map![
-			42.into() => AccountDiff {
+		let t = StateDiff(btreemap![
+			Address::from_low_u64_be(42) => AccountDiff {
 				balance: Diff::Same,
 				nonce: Diff::Born(1.into()),
 				code: Diff::Same,
-				storage: map![
-					42.into() => Diff::Same
+				storage: btreemap![
+					H256::from_low_u64_be(42) => Diff::Same
 				]
 			},
-			69.into() => AccountDiff {
+			Address::from_low_u64_be(69) => AccountDiff {
 				balance: Diff::Same,
 				nonce: Diff::Changed(ChangedType { from: 1.into(), to: 0.into() }),
 				code: Diff::Died(vec![96].into()),
-				storage: map![],
+				storage: btreemap![],
 			}
 		]);
 		let serialized = serde_json::to_string(&t).unwrap();

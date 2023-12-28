@@ -1,32 +1,27 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::str::FromStr;
-use std::path::Path;
-use std::fmt::{Display, Formatter, Error as FmtError};
 
-use mode::Mode as IpcMode;
+use blockchain::Config as BlockChainConfig;
+use journaldb;
+use snapshot::SnapshotConfiguration;
+use trace::Config as TraceConfig;
+use types::client_types::Mode;
 use verification::{VerifierType, QueueConfig};
-use util::journaldb;
-use kvdb::CompactionProfile;
-
-pub use std::time::Duration;
-pub use blockchain::Config as BlockChainConfig;
-pub use trace::Config as TraceConfig;
-pub use evm::VMType;
 
 /// Client state db compaction profile
 #[derive(Debug, PartialEq, Clone)]
@@ -45,17 +40,6 @@ impl Default for DatabaseCompactionProfile {
 	}
 }
 
-impl DatabaseCompactionProfile {
-	/// Returns corresponding compaction profile.
-	pub fn compaction_profile(&self, db_path: &Path) -> CompactionProfile {
-		match *self {
-			DatabaseCompactionProfile::Auto => CompactionProfile::auto(db_path),
-			DatabaseCompactionProfile::SSD => CompactionProfile::ssd(),
-			DatabaseCompactionProfile::HDD => CompactionProfile::hdd(),
-		}
-	}
-}
-
 impl FromStr for DatabaseCompactionProfile {
 	type Err = String;
 
@@ -69,63 +53,8 @@ impl FromStr for DatabaseCompactionProfile {
 	}
 }
 
-/// Operating mode for the client.
-#[derive(Debug, Eq, PartialEq, Clone)]
-pub enum Mode {
-	/// Always on.
-	Active,
-	/// Goes offline after RLP is inactive for some (given) time, but
-	/// comes back online after a while of inactivity.
-	Passive(Duration, Duration),
-	/// Goes offline after RLP is inactive for some (given) time and
-	/// stays inactive.
-	Dark(Duration),
-	/// Always off.
-	Off,
-}
-
-impl Default for Mode {
-	fn default() -> Self {
-		Mode::Active
-	}
-}
-
-impl Display for Mode {
-	fn fmt(&self, f: &mut Formatter) -> Result<(), FmtError> {
-		match *self {
-			Mode::Active => write!(f, "active"),
-			Mode::Passive(..) => write!(f, "passive"),
-			Mode::Dark(..) => write!(f, "dark"),
-			Mode::Off => write!(f, "offline"),
-		}
-	}
-}
-
-impl Into<IpcMode> for Mode {
-	fn into(self) -> IpcMode {
-		match self {
-			Mode::Off => IpcMode::Off,
-			Mode::Dark(timeout) => IpcMode::Dark(timeout.as_secs()),
-			Mode::Passive(timeout, alarm) => IpcMode::Passive(timeout.as_secs(), alarm.as_secs()),
-			Mode::Active => IpcMode::Active,
-		}
-	}
-}
-
-impl From<IpcMode> for Mode {
-	fn from(mode: IpcMode) -> Self {
-		match mode {
-			IpcMode::Off => Mode::Off,
-			IpcMode::Dark(timeout) => Mode::Dark(Duration::from_secs(timeout)),
-			IpcMode::Passive(timeout, alarm) => Mode::Passive(Duration::from_secs(timeout), Duration::from_secs(alarm)),
-			IpcMode::Active => Mode::Active,
-		}
-	}
-}
-
-
 /// Client configuration. Includes configs for all sub-systems.
-#[derive(Debug, PartialEq, Default)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct ClientConfig {
 	/// Block queue configuration.
 	pub queue: QueueConfig,
@@ -133,27 +62,23 @@ pub struct ClientConfig {
 	pub blockchain: BlockChainConfig,
 	/// Trace configuration.
 	pub tracing: TraceConfig,
-	/// VM type.
-	pub vm_type: VMType,
 	/// Fat DB enabled?
 	pub fat_db: bool,
 	/// The JournalDB ("pruning") algorithm to use.
 	pub pruning: journaldb::Algorithm,
 	/// The name of the client instance.
 	pub name: String,
-	/// RocksDB state column cache-size if not default
+	/// RocksDB column cache-size if not default
 	pub db_cache_size: Option<usize>,
 	/// State db compaction profile
 	pub db_compaction: DatabaseCompactionProfile,
-	/// Should db have WAL enabled?
-	pub db_wal: bool,
 	/// Operating mode
 	pub mode: Mode,
 	/// The chain spec name
 	pub spec_name: String,
 	/// Type of block verifier used by client.
 	pub verifier_type: VerifierType,
-	/// State db cache-size.
+	/// State db cache-size. Default: 25Mb.
 	pub state_cache_size: usize,
 	/// EVM jump-tables cache size.
 	pub jump_table_size: usize,
@@ -161,13 +86,51 @@ pub struct ClientConfig {
 	pub history: u64,
 	/// Ideal memory usage for state pruning history.
 	pub history_mem: usize,
-	/// Check seal valididity on block import
+	/// Check seal validity on block import
 	pub check_seal: bool,
+	/// Maximal number of transactions queued for verification in a separate thread.
+	pub transaction_verification_queue_size: usize,
+	/// Maximal number of blocks to import at each round.
+	pub max_round_blocks_to_import: usize,
+	/// Snapshot configuration
+	pub snapshot: SnapshotConfiguration,
+	/// Stop importing at this block and enter sleep mode.
+	pub sync_until: Option<u64>,
 }
 
+impl Default for ClientConfig {
+	fn default() -> Self {
+		let mb = 1024 * 1024;
+		// Note/TODO: the defaults here are overridden by the command line
+		// argument parser and changes to defaults here must be performed "over
+		// there" as well (see `cli/mod.rs` and https://github.com/openethereum/openethereum/issues/11574).
+		ClientConfig {
+			queue: Default::default(),
+			blockchain: Default::default(),
+			tracing: Default::default(),
+			fat_db: false,
+			pruning: journaldb::Algorithm::OverlayRecent,
+			name: "default".into(),
+			db_cache_size: None,
+			db_compaction: Default::default(),
+			mode: Mode::Active,
+			spec_name: "".into(),
+			verifier_type: VerifierType::Canon,
+			state_cache_size: 1 * mb,
+			jump_table_size: 1 * mb,
+			history: 128,
+			history_mem: 64 * mb,
+			check_seal: true,
+			transaction_verification_queue_size: 8192,
+			max_round_blocks_to_import: 12,
+			snapshot: Default::default(),
+			sync_until: None,
+		}
+	}
+}
 #[cfg(test)]
 mod test {
-	use super::{DatabaseCompactionProfile, Mode};
+	use super::DatabaseCompactionProfile;
 
 	#[test]
 	fn test_default_compaction_profile() {
@@ -179,10 +142,5 @@ mod test {
 		assert_eq!(DatabaseCompactionProfile::Auto, "auto".parse().unwrap());
 		assert_eq!(DatabaseCompactionProfile::SSD, "ssd".parse().unwrap());
 		assert_eq!(DatabaseCompactionProfile::HDD, "hdd".parse().unwrap());
-	}
-
-	#[test]
-	fn test_mode_default() {
-		assert_eq!(Mode::default(), Mode::Active);
 	}
 }

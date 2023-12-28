@@ -1,32 +1,33 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
+use ethereum_types::{H160, U256};
 use v1::helpers::CallRequest as Request;
-use v1::types::{Bytes, H160, U256};
+use v1::types::Bytes;
 
 /// Call request
 #[derive(Debug, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct CallRequest {
 	/// From
 	pub from: Option<H160>,
 	/// To
 	pub to: Option<H160>,
 	/// Gas Price
-	#[serde(rename="gasPrice")]
 	pub gas_price: Option<U256>,
 	/// Gas
 	pub gas: Option<U256>,
@@ -57,7 +58,7 @@ mod tests {
 	use std::str::FromStr;
 	use rustc_hex::FromHex;
 	use serde_json;
-	use v1::types::{U256, H160};
+	use ethereum_types::{U256, H160};
 	use super::CallRequest;
 
 	#[test]
@@ -74,8 +75,8 @@ mod tests {
 		let deserialized: CallRequest = serde_json::from_str(s).unwrap();
 
 		assert_eq!(deserialized, CallRequest {
-			from: Some(H160::from(1)),
-			to: Some(H160::from(2)),
+			from: Some(H160::from_low_u64_be(1)),
+			to: Some(H160::from_low_u64_be(2)),
 			gas_price: Some(U256::from(1)),
 			gas: Some(U256::from(2)),
 			value: Some(U256::from(3)),
@@ -102,7 +103,7 @@ mod tests {
 			gas_price: Some(U256::from_str("9184e72a000").unwrap()),
 			gas: Some(U256::from_str("76c0").unwrap()),
 			value: Some(U256::from_str("9184e72a").unwrap()),
-			data: Some("d46e8dd67c5d32be8d46e8dd67c5d32be8058bb8eb970870f072445675058bb8eb970870f072445675".from_hex().unwrap().into()),
+			data: Some("d46e8dd67c5d32be8d46e8dd67c5d32be8058bb8eb970870f072445675058bb8eb970870f072445675".from_hex::<Vec<u8>>().unwrap().into()),
 			nonce: None
 		});
 	}
@@ -113,7 +114,7 @@ mod tests {
 		let deserialized: CallRequest = serde_json::from_str(s).unwrap();
 
 		assert_eq!(deserialized, CallRequest {
-			from: Some(H160::from(1)),
+			from: Some(H160::from_low_u64_be(1)),
 			to: None,
 			gas_price: None,
 			gas: None,

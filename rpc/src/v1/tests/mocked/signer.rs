@@ -1,41 +1,43 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::sync::Arc;
 use std::str::FromStr;
-use bigint::prelude::U256;
-use util::Address;
+use ethereum_types::{H520, U256, Address};
 use bytes::ToPretty;
 
-use ethcore::account_provider::AccountProvider;
-use ethcore::client::TestBlockChainClient;
-use ethcore::transaction::{Transaction, Action, SignedTransaction};
-use parity_reactor::EventLoop;
+use accounts::AccountProvider;
+use ethcore::test_helpers::TestBlockChainClient;
+use parity_runtime::Runtime;
+use parking_lot::Mutex;
 use rlp::encode;
+use types::transaction::{Transaction, Action, SignedTransaction};
 
 use serde_json;
 use jsonrpc_core::IoHandler;
 use v1::{SignerClient, Signer, Origin};
 use v1::metadata::Metadata;
 use v1::tests::helpers::TestMinerService;
-use v1::types::{Bytes as RpcBytes, H520};
-use v1::helpers::{SigningQueue, SignerService, FilledTransactionRequest, ConfirmationPayload};
-use v1::helpers::dispatch::{FullDispatcher, eth_data_hash};
+use v1::types::Bytes as RpcBytes;
+use v1::helpers::{nonce, FilledTransactionRequest, ConfirmationPayload};
+use v1::helpers::external_signer::{SigningQueue, SignerService};
+use v1::helpers::dispatch::{self, FullDispatcher, eth_data_hash};
 
 struct SignerTester {
+	_runtime: Runtime,
 	signer: Arc<SignerService>,
 	accounts: Arc<AccountProvider>,
 	io: IoHandler<Metadata>,
@@ -56,18 +58,20 @@ fn miner_service() -> Arc<TestMinerService> {
 }
 
 fn signer_tester() -> SignerTester {
+	let runtime = Runtime::with_thread_count(1);
 	let signer = Arc::new(SignerService::new_test(false));
 	let accounts = accounts_provider();
-	let opt_accounts = Some(accounts.clone());
+	let account_signer = Arc::new(dispatch::Signer::new(accounts.clone()));
 	let client = blockchain_client();
 	let miner = miner_service();
-	let event_loop = EventLoop::spawn();
+	let reservations = Arc::new(Mutex::new(nonce::Reservations::new(runtime.executor())));
 
-	let dispatcher = FullDispatcher::new(client, miner.clone());
+	let dispatcher = FullDispatcher::new(client, miner.clone(), reservations, 50);
 	let mut io = IoHandler::default();
-	io.extend_with(SignerClient::new(&opt_accounts, dispatcher, &signer, event_loop.remote()).to_delegate());
+	io.extend_with(SignerClient::new(account_signer, dispatcher, &signer, runtime.executor()).to_delegate());
 
 	SignerTester {
+		_runtime: runtime,
 		signer: signer,
 		accounts: accounts,
 		io: io,
@@ -75,13 +79,12 @@ fn signer_tester() -> SignerTester {
 	}
 }
 
-
 #[test]
 fn should_return_list_of_items_to_confirm() {
 	// given
 	let tester = signer_tester();
-	tester.signer.add_request(ConfirmationPayload::SendTransaction(FilledTransactionRequest {
-		from: Address::from(1),
+	let _send_future = tester.signer.add_request(ConfirmationPayload::SendTransaction(FilledTransactionRequest {
+		from: Address::from_low_u64_be(1),
 		used_default_from: false,
 		to: Some(Address::from_str("d46e8dd67c5d32be8058bb8eb970870f07244567").unwrap()),
 		gas_price: U256::from(10_000),
@@ -90,14 +93,14 @@ fn should_return_list_of_items_to_confirm() {
 		data: vec![],
 		nonce: None,
 		condition: None,
-	}), Origin::Dapps("http://parity.io".into())).unwrap();
-	tester.signer.add_request(ConfirmationPayload::EthSignMessage(1.into(), vec![5].into()), Origin::Unknown).unwrap();
+	}), Origin::Unknown).unwrap();
+	let _sign_future = tester.signer.add_request(ConfirmationPayload::EthSignMessage(Address::from_low_u64_be(1), vec![5].into()), Origin::Unknown).unwrap();
 
 	// when
 	let request = r#"{"jsonrpc":"2.0","method":"signer_requestsToConfirm","params":[],"id":1}"#;
 	let response = concat!(
 		r#"{"jsonrpc":"2.0","result":["#,
-		r#"{"id":"0x1","origin":{"dapp":"http://parity.io"},"payload":{"sendTransaction":{"condition":null,"data":"0x","from":"0x0000000000000000000000000000000000000001","gas":"0x989680","gasPrice":"0x2710","nonce":null,"to":"0xd46e8dd67c5d32be8058bb8eb970870f07244567","value":"0x1"}}},"#,
+		r#"{"id":"0x1","origin":"unknown","payload":{"sendTransaction":{"condition":null,"data":"0x","from":"0x0000000000000000000000000000000000000001","gas":"0x989680","gasPrice":"0x2710","nonce":null,"to":"0xd46e8dd67c5d32be8058bb8eb970870f07244567","value":"0x1"}}},"#,
 		r#"{"id":"0x2","origin":"unknown","payload":{"sign":{"address":"0x0000000000000000000000000000000000000001","data":"0x05"}}}"#,
 		r#"],"id":1}"#
 	);
@@ -106,13 +109,12 @@ fn should_return_list_of_items_to_confirm() {
 	assert_eq!(tester.io.handle_request_sync(&request), Some(response.to_owned()));
 }
 
-
 #[test]
 fn should_reject_transaction_from_queue_without_dispatching() {
 	// given
 	let tester = signer_tester();
-	tester.signer.add_request(ConfirmationPayload::SendTransaction(FilledTransactionRequest {
-		from: Address::from(1),
+	let _confirmation_future = tester.signer.add_request(ConfirmationPayload::SendTransaction(FilledTransactionRequest {
+		from: Address::from_low_u64_be(1),
 		used_default_from: false,
 		to: Some(Address::from_str("d46e8dd67c5d32be8058bb8eb970870f07244567").unwrap()),
 		gas_price: U256::from(10_000),
@@ -138,8 +140,8 @@ fn should_reject_transaction_from_queue_without_dispatching() {
 fn should_not_remove_transaction_if_password_is_invalid() {
 	// given
 	let tester = signer_tester();
-	tester.signer.add_request(ConfirmationPayload::SendTransaction(FilledTransactionRequest {
-		from: Address::from(1),
+	let _confirmation_future = tester.signer.add_request(ConfirmationPayload::SendTransaction(FilledTransactionRequest {
+		from: Address::from_low_u64_be(1),
 		used_default_from: false,
 		to: Some(Address::from_str("d46e8dd67c5d32be8058bb8eb970870f07244567").unwrap()),
 		gas_price: U256::from(10_000),
@@ -164,7 +166,7 @@ fn should_not_remove_transaction_if_password_is_invalid() {
 fn should_not_remove_sign_if_password_is_invalid() {
 	// given
 	let tester = signer_tester();
-	tester.signer.add_request(ConfirmationPayload::EthSignMessage(0.into(), vec![5].into()), Origin::Unknown).unwrap();
+	let _confirmation_future = tester.signer.add_request(ConfirmationPayload::EthSignMessage(Address::zero(), vec![5].into()), Origin::Unknown).unwrap();
 	assert_eq!(tester.signer.requests().len(), 1);
 
 	// when
@@ -180,9 +182,9 @@ fn should_not_remove_sign_if_password_is_invalid() {
 fn should_confirm_transaction_and_dispatch() {
 	//// given
 	let tester = signer_tester();
-	let address = tester.accounts.new_account("test").unwrap();
+	let address = tester.accounts.new_account(&"test".into()).unwrap();
 	let recipient = Address::from_str("d46e8dd67c5d32be8058bb8eb970870f07244567").unwrap();
-	tester.signer.add_request(ConfirmationPayload::SendTransaction(FilledTransactionRequest {
+	let _confirmation_future = tester.signer.add_request(ConfirmationPayload::SendTransaction(FilledTransactionRequest {
 		from: address,
 		used_default_from: false,
 		to: Some(recipient),
@@ -215,7 +217,7 @@ fn should_confirm_transaction_and_dispatch() {
 		"params":["0x1", {"gasPrice":"0x1000","gas":"0x50505"}, "test"],
 		"id":1
 	}"#;
-	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + format!("0x{:?}", t.hash()).as_ref() + r#"","id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + format!("0x{:x}", t.hash()).as_ref() + r#"","id":1}"#;
 
 	// then
 	assert_eq!(tester.io.handle_request_sync(&request), Some(response.to_owned()));
@@ -228,8 +230,8 @@ fn should_alter_the_sender_and_nonce() {
 	//// given
 	let tester = signer_tester();
 	let recipient = Address::from_str("d46e8dd67c5d32be8058bb8eb970870f07244567").unwrap();
-	tester.signer.add_request(ConfirmationPayload::SendTransaction(FilledTransactionRequest {
-		from: 0.into(),
+	let _confirmation_future = tester.signer.add_request(ConfirmationPayload::SendTransaction(FilledTransactionRequest {
+		from: Address::zero(),
 		used_default_from: false,
 		to: Some(recipient),
 		gas_price: U256::from(10_000),
@@ -249,7 +251,7 @@ fn should_alter_the_sender_and_nonce() {
 		data: vec![]
 	};
 
-	let address = tester.accounts.new_account("test").unwrap();
+	let address = tester.accounts.new_account(&"test".into()).unwrap();
 	let signature = tester.accounts.sign(address, Some("test".into()), t.hash(None)).unwrap();
 	let t = t.with_signature(signature, None);
 
@@ -260,11 +262,11 @@ fn should_alter_the_sender_and_nonce() {
 		"jsonrpc":"2.0",
 		"method":"signer_confirmRequest",
 		"params":["0x1", {"sender":""#.to_owned()
-		+ &format!("0x{:?}", address)
+		+ &format!("0x{:x}", address)
 		+ r#"","gasPrice":"0x1000","gas":"0x50505"}, "test"],
 		"id":1
 	}"#;
-	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + &format!("0x{:?}", t.hash()) + r#"","id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + &format!("0x{:x}", t.hash()) + r#"","id":1}"#;
 
 	// then
 	assert_eq!(tester.io.handle_request_sync(&request), Some(response.to_owned()));
@@ -276,9 +278,9 @@ fn should_alter_the_sender_and_nonce() {
 fn should_confirm_transaction_with_token() {
 	// given
 	let tester = signer_tester();
-	let address = tester.accounts.new_account("test").unwrap();
+	let address = tester.accounts.new_account(&"test".into()).unwrap();
 	let recipient = Address::from_str("d46e8dd67c5d32be8058bb8eb970870f07244567").unwrap();
-	tester.signer.add_request(ConfirmationPayload::SendTransaction(FilledTransactionRequest {
+	let _confirmation_future = tester.signer.add_request(ConfirmationPayload::SendTransaction(FilledTransactionRequest {
 		from: address,
 		used_default_from: false,
 		to: Some(recipient),
@@ -307,11 +309,11 @@ fn should_confirm_transaction_with_token() {
 	let request = r#"{
 		"jsonrpc":"2.0",
 		"method":"signer_confirmRequestWithToken",
-		"params":["0x1", {"gasPrice":"0x1000"}, ""#.to_owned() + &token + r#""],
+		"params":["0x1", {"gasPrice":"0x1000"}, ""#.to_owned() + token.as_str() + r#""],
 		"id":1
 	}"#;
 	let response = r#"{"jsonrpc":"2.0","result":{"result":""#.to_owned() +
-		format!("0x{:?}", t.hash()).as_ref() +
+		format!("0x{:x}", t.hash()).as_ref() +
 		r#"","token":""#;
 
 	// then
@@ -325,9 +327,9 @@ fn should_confirm_transaction_with_token() {
 fn should_confirm_transaction_with_rlp() {
 	// given
 	let tester = signer_tester();
-	let address = tester.accounts.new_account("test").unwrap();
+	let address = tester.accounts.new_account(&"test".into()).unwrap();
 	let recipient = Address::from_str("d46e8dd67c5d32be8058bb8eb970870f07244567").unwrap();
-	tester.signer.add_request(ConfirmationPayload::SendTransaction(FilledTransactionRequest {
+	let _confirmation_future = tester.signer.add_request(ConfirmationPayload::SendTransaction(FilledTransactionRequest {
 		from: address,
 		used_default_from: false,
 		to: Some(recipient),
@@ -360,7 +362,7 @@ fn should_confirm_transaction_with_rlp() {
 		"params":["0x1", "0x"#.to_owned() + &rlp.to_hex() + r#""],
 		"id":1
 	}"#;
-	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + format!("0x{:?}", t.hash()).as_ref() + r#"","id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + format!("0x{:x}", t.hash()).as_ref() + r#"","id":1}"#;
 
 	// then
 	assert_eq!(tester.io.handle_request_sync(&request), Some(response.to_owned()));
@@ -372,10 +374,10 @@ fn should_confirm_transaction_with_rlp() {
 fn should_return_error_when_sender_does_not_match() {
 	// given
 	let tester = signer_tester();
-	let address = tester.accounts.new_account("test").unwrap();
+	let address = tester.accounts.new_account(&"test".into()).unwrap();
 	let recipient = Address::from_str("d46e8dd67c5d32be8058bb8eb970870f07244567").unwrap();
-	tester.signer.add_request(ConfirmationPayload::SendTransaction(FilledTransactionRequest {
-		from: Address::default(),
+	let _confirmation_future = tester.signer.add_request(ConfirmationPayload::SendTransaction(FilledTransactionRequest {
+		from: Address::zero(),
 		used_default_from: false,
 		to: Some(recipient),
 		gas_price: U256::from(10_000),
@@ -419,9 +421,9 @@ fn should_return_error_when_sender_does_not_match() {
 fn should_confirm_sign_transaction_with_rlp() {
 	// given
 	let tester = signer_tester();
-	let address = tester.accounts.new_account("test").unwrap();
+	let address = tester.accounts.new_account(&"test".into()).unwrap();
 	let recipient = Address::from_str("d46e8dd67c5d32be8058bb8eb970870f07244567").unwrap();
-	tester.signer.add_request(ConfirmationPayload::SignTransaction(FilledTransactionRequest {
+	let _confirmation_future = tester.signer.add_request(ConfirmationPayload::SignTransaction(FilledTransactionRequest {
 		from: address,
 		used_default_from: false,
 		to: Some(recipient),
@@ -456,21 +458,21 @@ fn should_confirm_sign_transaction_with_rlp() {
 	let response = r#"{"jsonrpc":"2.0","result":{"#.to_owned() +
 		r#""raw":"0x"# + &rlp.to_hex() + r#"","# +
 		r#""tx":{"# +
-		r#""blockHash":null,"blockNumber":"0x0","# +
+		r#""blockHash":null,"blockNumber":null,"# +
 		&format!("\"chainId\":{},", t.chain_id().map_or("null".to_owned(), |n| format!("{}", n))) +
 		r#""condition":null,"creates":null,"# +
-		&format!("\"from\":\"0x{:?}\",", &address) +
+		&format!("\"from\":\"0x{:x}\",", &address) +
 		r#""gas":"0x989680","gasPrice":"0x1000","# +
-		&format!("\"hash\":\"0x{:?}\",", t.hash()) +
+		&format!("\"hash\":\"0x{:x}\",", t.hash()) +
 		r#""input":"0x","# +
 		r#""nonce":"0x0","# +
-		&format!("\"publicKey\":\"0x{:?}\",", t.public_key().unwrap()) +
-		&format!("\"r\":\"0x{}\",", U256::from(signature.r()).to_hex()) +
+		&format!("\"publicKey\":\"0x{:x}\",", t.public_key().unwrap()) +
+		&format!("\"r\":\"0x{:x}\",", U256::from(signature.r())) +
 		&format!("\"raw\":\"0x{}\",", rlp.to_hex()) +
-		&format!("\"s\":\"0x{}\",", U256::from(signature.s()).to_hex()) +
-		&format!("\"standardV\":\"0x{}\",", U256::from(t.standard_v()).to_hex()) +
+		&format!("\"s\":\"0x{:x}\",", U256::from(signature.s())) +
+		&format!("\"standardV\":\"0x{:x}\",", U256::from(t.standard_v())) +
 		r#""to":"0xd46e8dd67c5d32be8058bb8eb970870f07244567","transactionIndex":null,"# +
-		&format!("\"v\":\"0x{}\",", U256::from(t.original_v()).to_hex()) +
+		&format!("\"v\":\"0x{:x}\",", U256::from(t.original_v())) +
 		r#""value":"0x1""# +
 		r#"}},"id":1}"#;
 
@@ -484,8 +486,8 @@ fn should_confirm_sign_transaction_with_rlp() {
 fn should_confirm_data_sign_with_signature() {
 	// given
 	let tester = signer_tester();
-	let address = tester.accounts.new_account("test").unwrap();
-	tester.signer.add_request(ConfirmationPayload::EthSignMessage(
+	let address = tester.accounts.new_account(&"test".into()).unwrap();
+	let _confirmation_future = tester.signer.add_request(ConfirmationPayload::EthSignMessage(
 		address,
 		vec![1, 2, 3, 4].into(),
 	), Origin::Unknown).unwrap();
@@ -493,7 +495,7 @@ fn should_confirm_data_sign_with_signature() {
 
 	let data_hash = eth_data_hash(vec![1, 2, 3, 4].into());
 	let signature = H520(tester.accounts.sign(address, Some("test".into()), data_hash).unwrap().into_electrum());
-	let signature = format!("0x{:?}", signature);
+	let signature = format!("{:?}", signature);
 
 	// when
 	let request = r#"{
@@ -514,8 +516,8 @@ fn should_confirm_data_sign_with_signature() {
 fn should_confirm_decrypt_with_phrase() {
 	// given
 	let tester = signer_tester();
-	let address = tester.accounts.new_account("test").unwrap();
-	tester.signer.add_request(ConfirmationPayload::Decrypt(
+	let address = tester.accounts.new_account(&"test".into()).unwrap();
+	let _confirmation_future = tester.signer.add_request(ConfirmationPayload::Decrypt(
 		address,
 		vec![1, 2, 3, 4].into(),
 	), Origin::Unknown).unwrap();
@@ -554,30 +556,4 @@ fn should_generate_new_token() {
 
 	// then
 	assert_eq!(tester.io.handle_request_sync(&request), Some(response.to_owned()));
-}
-
-#[test]
-fn should_generate_new_web_proxy_token() {
-	use jsonrpc_core::{Response, Output, Value};
-	// given
-	let tester = signer_tester();
-
-	// when
-	let request = r#"{
-		"jsonrpc":"2.0",
-		"method":"signer_generateWebProxyAccessToken",
-		"params":["https://parity.io"],
-		"id":1
-	}"#;
-	let response = tester.io.handle_request_sync(&request).unwrap();
-	let result = serde_json::from_str(&response).unwrap();
-
-	if let Response::Single(Output::Success(ref success)) = result {
-		if let Value::String(ref token) = success.result {
-			assert_eq!(tester.signer.web_proxy_access_token_domain(&token), Some("https://parity.io".into()));
-			return;
-		}
-	}
-
-	assert!(false, "Expected successful response, got: {:?}", result);
 }

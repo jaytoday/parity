@@ -1,122 +1,133 @@
 [package]
-description = "Parity Ethereum client"
-name = "parity"
-version = "1.8.0"
+description = "OpenEthereum"
+name = "openethereum"
+# NOTE Make sure to update util/version/Cargo.toml as well
+version = "3.0.0"
 license = "GPL-3.0"
-authors = ["Parity Technologies <admin@parity.io>"]
-build = "build.rs"
+authors = [
+	"OpenEthereum developers",
+	"Parity Technologies <admin@parity.io>"
+]
 
 [dependencies]
-log = "0.3"
-env_logger = "0.4"
-rustc-hex = "1.0"
-docopt = "0.8"
+ansi_term = "0.11"
+atty = "0.2.8"
+blooms-db = { path = "util/blooms-db" }
 clap = "2"
-time = "0.1"
+cli-signer= { path = "cli-signer" }
+client-traits = { path = "ethcore/client-traits" }
+common-types = { path = "ethcore/types" }
+ctrlc = { version = "3.1.4", features = ["termination"] }
+dir = { path = "util/dir" }
+docopt = "1.0"
+engine = { path = "ethcore/engine" }
+ethabi = { version = "12.0", optional = true }
+ethcore = { path = "ethcore", features = ["parity"] }
+ethcore-accounts = { path = "accounts", optional = true }
+ethcore-blockchain = { path = "ethcore/blockchain" }
+ethcore-call-contract = { path = "ethcore/call-contract", optional = true }
+ethcore-db = { path = "ethcore/db" }
+ethcore-io = { path = "util/io" }
+ethcore-light = { path = "ethcore/light" }
+ethcore-logger = { path = "parity/logger" }
+ethcore-miner = { path = "miner" }
+ethcore-network = { path = "util/network" }
+ethcore-private-tx = { path = "ethcore/private-tx" }
+ethcore-service = { path = "ethcore/service" }
+ethcore-sync = { path = "ethcore/sync" }
+ethereum-types = "0.9.2"
+ethkey = { path = "accounts/ethkey" }
+ethstore = { path = "accounts/ethstore" }
+fdlimit = "0.1"
+futures = "0.1"
+journaldb = { path = "util/journaldb" }
+jsonrpc-core = "15.0.0"
+keccak-hash = "0.5.0"
+kvdb = "0.7"
+kvdb-rocksdb = "0.9"
+log = "0.4"
+migration-rocksdb = { path = "util/migration-rocksdb" }
+node-filter = { path = "ethcore/node-filter" }
 num_cpus = "1.2"
 number_prefix = "0.2"
-rpassword = "0.2.1"
-semver = "0.6"
-ansi_term = "0.9"
-parking_lot = "0.4"
-regex = "0.2"
-isatty = "0.1"
-toml = "0.4"
-serde = "1.0"
-serde_json = "1.0"
-serde_derive = "1.0"
-app_dirs = "1.1.1"
-futures = "0.1"
-futures-cpupool = "0.1"
-fdlimit = "0.1"
-ws2_32-sys = "0.2"
-ctrlc = { git = "https://github.com/paritytech/rust-ctrlc.git" }
-jsonrpc-core = { git = "https://github.com/paritytech/jsonrpc.git", branch = "parity-1.8" }
-ethsync = { path = "sync" }
-ethcore = { path = "ethcore" }
-ethcore-util = { path = "util" }
-ethcore-bytes = { path = "util/bytes" }
-ethcore-bigint = { path = "util/bigint" }
-ethcore-io = { path = "util/io" }
-ethcore-devtools = { path = "devtools" }
-ethcore-ipc = { path = "ipc/rpc" }
-ethcore-ipc-nano = { path = "ipc/nano" }
-ethcore-ipc-hypervisor = { path = "ipc/hypervisor" }
-ethcore-light = { path = "ethcore/light" }
-ethcore-logger = { path = "logger" }
-ethcore-stratum = { path = "stratum" }
-ethcore-network = { path = "util/network" }
-node-filter = { path = "ethcore/node_filter" }
-ethkey = { path = "ethkey" }
-node-health = { path = "dapps/node-health" }
-rlp = { path = "util/rlp" }
-rpc-cli = { path = "rpc_cli" }
-parity-hash-fetch = { path = "hash-fetch" }
-parity-ipfs-api = { path = "ipfs" }
-parity-local-store = { path = "local-store" }
-parity-reactor = { path = "util/reactor" }
+panic_hook = { path = "util/panic-hook" }
+parity-bytes = "0.1"
+parity-crypto = { version = "0.6.2", features = ["publickey"] }
+parity-daemonize = "0.3"
+parity-hash-fetch = { path = "updater/hash-fetch" }
+parity-local-store = { path = "miner/local-store" }
+parity-path = "0.1"
 parity-rpc = { path = "rpc" }
-parity-rpc-client = { path = "rpc_client" }
+parity-runtime = "0.1.1"
+parity-secretstore = { git = "https://github.com/paritytech/secret-store", branch = "v1.x", optional = true }
 parity-updater = { path = "updater" }
-parity-whisper = { path = "whisper" }
-path = { path = "util/path" }
-panic_hook = { path = "panic_hook" }
-hash = { path = "util/hash" }
-migration = { path = "util/migration" }
-kvdb = { path = "util/kvdb" }
-
-parity-dapps = { path = "dapps", optional = true }
-clippy = { version = "0.0.103", optional = true}
-ethcore-secretstore = { path = "secret_store", optional = true }
+parity-util-mem = { version = "0.7", features = ["jemalloc-global"] }
+parity-version = { path = "util/version" }
+parking_lot = "0.10.0"
+regex = "1.0"
+registrar = { path = "util/registrar" }
+rlp = "0.4.5"
+rpassword = "1.0"
+rustc-hex = "2.1.0"
+semver = "0.9"
+serde = "1.0"
+serde_derive = "1.0"
+serde_json = "1.0"
+snapshot = { path = "ethcore/snapshot" }
+spec = { path = "ethcore/spec" }
+term_size = "0.3"
+textwrap = "0.11.0"
+toml = "0.5.6"
+verification = { path = "ethcore/verification" }
 
 [build-dependencies]
 rustc_version = "0.2"
 
 [dev-dependencies]
-ethcore-ipc-tests = { path = "ipc/tests" }
 pretty_assertions = "0.1"
 ipnetwork = "0.12.6"
+tempfile = "3.1"
+fake-fetch = { path = "util/fake-fetch" }
 
 [target.'cfg(windows)'.dependencies]
-winapi = "0.2"
-
-[target.'cfg(not(windows))'.dependencies]
-daemonize = "0.2"
+winapi = { version = "0.3.8", features = ["winsock2", "winuser", "shellapi"] }
 
 [features]
-default = ["ui-precompiled"]
-ui = [
-	"ui-enabled",
-	"parity-dapps/ui",
-]
-ui-precompiled = [
-	"ui-enabled",
-	"parity-dapps/ui-precompiled",
-]
-ui-enabled = ["dapps"]
-dapps = ["parity-dapps"]
-ipc = ["ethcore/ipc", "ethsync/ipc"]
-jit = ["ethcore/jit"]
-dev = ["clippy", "ethcore/dev", "ethcore-util/dev", "ethsync/dev", "parity-rpc/dev", "parity-dapps/dev"]
+default = ["accounts"]
+accounts = ["ethcore-accounts", "parity-rpc/accounts"]
+miner-debug = ["ethcore/miner-debug"]
 json-tests = ["ethcore/json-tests"]
 test-heavy = ["ethcore/test-heavy"]
 evm-debug = ["ethcore/evm-debug"]
 evm-debug-tests = ["ethcore/evm-debug-tests"]
 slow-blocks = ["ethcore/slow-blocks"]
-final = ["ethcore-util/final"]
-secretstore = ["ethcore-secretstore"]
+secretstore = ["parity-secretstore", "accounts", "ethabi", "ethcore-call-contract"]
+final = ["parity-version/final"]
+deadlock_detection = ["parking_lot/deadlock_detection"]
+# hardcode version number 1.3.7 of parity to force an update
+# in order to manually test that parity fall-over to the local version
+# in case of invalid or deprecated command line arguments are entered
+test-updater = ["parity-updater/test-updater"]
+
+[lib]
+path = "parity/lib.rs"
 
 [[bin]]
 path = "parity/main.rs"
-name = "parity"
-
-[profile.dev]
-panic = "abort"
+name = "openethereum"
 
 [profile.release]
 debug = false
-lto = false
-panic = "abort"
+lto = true
 
 [workspace]
-members = ["ethstore/cli", "ethkey/cli", "evmbin", "whisper", "chainspec", "dapps/js-glue"]
+# This should only list projects that are not
+# in the dependency tree in any other way
+# (i.e. pretty much only standalone CLI tools)
+members = [
+	"accounts/ethkey/cli",
+	"accounts/ethstore/cli",
+	"chainspec",
+	"ethcore/wasm/run",
+	"evmbin",
+]

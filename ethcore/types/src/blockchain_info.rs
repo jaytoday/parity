@@ -1,27 +1,27 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Blockhain info type definition
 
+use crate::{
+	BlockNumber,
+	security_level::SecurityLevel,
+};
+use ethereum_types::{U256, H256};
 use std::fmt;
-
-use bigint::prelude::U256;
-use bigint::hash::H256;
-use security_level::SecurityLevel;
-use {BlockNumber};
 
 /// Information about the blockchain gathered together.
 #[derive(Clone, Debug)]
@@ -51,7 +51,7 @@ pub struct BlockChainInfo {
 impl BlockChainInfo {
 	/// Determine the security model for the current state.
 	pub fn security_level(&self) -> SecurityLevel {
-		// TODO: Detect SecurityLevel::FullState : https://github.com/paritytech/parity/issues/3834
+		// TODO: Detect SecurityLevel::FullState : https://github.com/openethereum/openethereum/issues/3834
 		if self.ancient_block_number.is_none() || self.first_block_number.is_none() {
 			SecurityLevel::FullProofOfWork
 		} else {

@@ -1,39 +1,57 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::path::Path;
 use std::sync::Arc;
 use super::test_common::*;
-use state::{Backend as StateBackend, State, Substate};
-use executive::*;
-use evm::{VMType, Finalize};
+use account_state::{Backend as StateBackend, State};
+use evm::Finalize;
 use vm::{
-	self, ActionParams, CallType, Schedule, Ext,
+	self, ActionParams, ActionType, Schedule, Ext,
 	ContractCreateResult, EnvInfo, MessageCallResult,
 	CreateContractAddress, ReturnData,
 };
-use externalities::*;
-use tests::helpers::*;
+use machine::{
+	Machine,
+	externalities::{OutputPolicy, OriginInfo, Externalities},
+	substate::Substate,
+	executive::contract_address,
+};
+
+use test_helpers::get_temp_state;
 use ethjson;
-use trace::{Tracer, NoopTracer};
-use trace::{VMTracer, NoopVMTracer};
-use bytes::{Bytes, BytesRef};
-use trie;
+use trace::{Tracer, NoopTracer, VMTracer, NoopVMTracer};
+use bytes::Bytes;
+use ethtrie;
 use rlp::RlpStream;
 use hash::keccak;
-use machine::EthereumMachine as Machine;
+use ethereum_types::BigEndianHash;
+use spec;
+
+use super::HookType;
+
+/// Run executive jsontests on a given folder.
+pub fn run_test_path<H: FnMut(&str, HookType)>(p: &Path, skip: &[&'static str], h: &mut H) {
+	::json_tests::test_common::run_test_path(p, skip, do_json_test, h)
+}
+
+/// Run executive jsontests on a given file.
+pub fn run_test_file<H: FnMut(&str, HookType)>(p: &Path, h: &mut H) {
+	::json_tests::test_common::run_test_file(p, do_json_test, h)
+}
 
 #[derive(Debug, PartialEq, Clone)]
 struct CallCreate {
@@ -73,18 +91,19 @@ impl<'a, T: 'a, V: 'a, B: 'a> TestExt<'a, T, V, B>
 		state: &'a mut State<B>,
 		info: &'a EnvInfo,
 		machine: &'a Machine,
+		schedule: &'a Schedule,
 		depth: usize,
-		origin_info: OriginInfo,
+		origin_info: &'a OriginInfo,
 		substate: &'a mut Substate,
-		output: OutputPolicy<'a, 'a>,
+		output: OutputPolicy,
 		address: Address,
 		tracer: &'a mut T,
 		vm_tracer: &'a mut V,
-	) -> trie::Result<Self> {
+	) -> ethtrie::Result<Self> {
 		let static_call = false;
 		Ok(TestExt {
 			nonce: state.nonce(&address)?,
-			ext: Externalities::new(state, info, machine, depth, origin_info, substate, output, tracer, vm_tracer, static_call),
+			ext: Externalities::new(state, info, machine, schedule, depth, 0, origin_info, substate, output, tracer, vm_tracer, static_call),
 			callcreates: vec![],
 			sender: address,
 		})
@@ -96,6 +115,10 @@ impl<'a, T: 'a, V: 'a, B: 'a> Ext for TestExt<'a, T, V, B>
 {
 	fn storage_at(&self, key: &H256) -> vm::Result<H256> {
 		self.ext.storage_at(key)
+	}
+
+	fn initial_storage_at(&self, key: &H256) -> vm::Result<H256> {
+		self.ext.initial_storage_at(key)
 	}
 
 	fn set_storage(&mut self, key: H256, value: H256) -> vm::Result<()> {
@@ -122,7 +145,15 @@ impl<'a, T: 'a, V: 'a, B: 'a> Ext for TestExt<'a, T, V, B>
 		self.ext.blockhash(number)
 	}
 
-	fn create(&mut self, gas: &U256, value: &U256, code: &[u8], address: CreateContractAddress) -> ContractCreateResult {
+	fn create(
+		&mut self,
+		gas: &U256,
+		value: &U256,
+		code: &[u8],
+		_code_version: &U256,
+		address: CreateContractAddress,
+		_trap: bool
+	) -> Result<ContractCreateResult, vm::TrapKind> {
 		self.callcreates.push(CallCreate {
 			data: code.to_vec(),
 			destination: None,
@@ -130,34 +161,39 @@ impl<'a, T: 'a, V: 'a, B: 'a> Ext for TestExt<'a, T, V, B>
 			value: *value
 		});
 		let contract_address = contract_address(address, &self.sender, &self.nonce, &code).0;
-		ContractCreateResult::Created(contract_address, *gas)
+		Ok(ContractCreateResult::Created(contract_address, *gas))
 	}
 
-	fn call(&mut self,
+	fn call(
+		&mut self,
 		gas: &U256,
 		_sender_address: &Address,
 		receive_address: &Address,
 		value: Option<U256>,
 		data: &[u8],
 		_code_address: &Address,
-		_output: &mut [u8],
-		_call_type: CallType
-	) -> MessageCallResult {
+		_call_type: ActionType,
+		_trap: bool
+	) -> Result<MessageCallResult, vm::TrapKind> {
 		self.callcreates.push(CallCreate {
 			data: data.to_vec(),
 			destination: Some(receive_address.clone()),
 			gas_limit: *gas,
 			value: value.unwrap()
 		});
-		MessageCallResult::Success(*gas, ReturnData::empty())
+		Ok(MessageCallResult::Success(*gas, ReturnData::empty()))
 	}
 
-	fn extcode(&self, address: &Address) -> vm::Result<Arc<Bytes>>  {
+	fn extcode(&self, address: &Address) -> vm::Result<Option<Arc<Bytes>>>  {
 		self.ext.extcode(address)
 	}
 
-	fn extcodesize(&self, address: &Address) -> vm::Result<usize> {
+	fn extcodesize(&self, address: &Address) -> vm::Result<Option<usize>> {
 		self.ext.extcodesize(address)
+	}
+
+	fn extcodehash(&self, address: &Address) -> vm::Result<Option<H256>> {
+		self.ext.extcodehash(address)
 	}
 
 	fn log(&mut self, topics: Vec<H256>, data: &[u8]) -> vm::Result<()> {
@@ -180,6 +216,8 @@ impl<'a, T: 'a, V: 'a, B: 'a> Ext for TestExt<'a, T, V, B>
 		self.ext.env_info()
 	}
 
+	fn chain_id(&self) -> u64 { 0 }
+
 	fn depth(&self) -> usize {
 		0
 	}
@@ -188,29 +226,32 @@ impl<'a, T: 'a, V: 'a, B: 'a> Ext for TestExt<'a, T, V, B>
 		false
 	}
 
-	fn inc_sstore_clears(&mut self) {
-		self.ext.inc_sstore_clears()
+	fn add_sstore_refund(&mut self, value: usize) {
+		self.ext.add_sstore_refund(value)
+	}
+
+	fn sub_sstore_refund(&mut self, value: usize) {
+		self.ext.sub_sstore_refund(value)
 	}
 }
 
-fn do_json_test(json_data: &[u8]) -> Vec<String> {
-	let vms = VMType::all();
-	vms
-		.iter()
-		.flat_map(|vm| do_json_test_for(vm, json_data))
-		.collect()
-}
-
-fn do_json_test_for(vm_type: &VMType, json_data: &[u8]) -> Vec<String> {
-	let tests = ethjson::vm::Test::load(json_data).unwrap();
+fn do_json_test<H: FnMut(&str, HookType)>(
+	path: &Path,
+	json_data: &[u8],
+	start_stop_hook: &mut H
+) -> Vec<String> {
+	let tests = ethjson::test_helpers::vm::Test::load(json_data)
+		.expect(&format!("Could not parse JSON executive test data from {}", path.display()));
 	let mut failed = Vec::new();
 
 	for (name, vm) in tests.into_iter() {
-		println!("name: {:?}", name);
+		start_stop_hook(&format!("{}", name), HookType::OnStart);
+
+		info!(target: "jsontests", "name: {:?}", name);
 		let mut fail = false;
 
 		let mut fail_unless = |cond: bool, s: &str | if !cond && !fail {
-			failed.push(format!("[{}] {}: {}", vm_type, name, s));
+			failed.push(format!("{}: {}", name, s));
 			fail = true
 		};
 
@@ -230,9 +271,9 @@ fn do_json_test_for(vm_type: &VMType, json_data: &[u8]) -> Vec<String> {
 		let out_of_gas = vm.out_of_gas();
 		let mut state = get_temp_state();
 		state.populate_from(From::from(vm.pre_state.clone()));
-		let info = From::from(vm.env);
+		let info: EnvInfo = From::from(vm.env);
 		let machine = {
-			let mut machine = ::ethereum::new_frontier_test_machine();
+			let mut machine = spec::new_frontier_test_machine();
 			machine.set_schedule_creation_rules(Box::new(move |s, _| s.max_depth = 1));
 			machine
 		};
@@ -242,28 +283,35 @@ fn do_json_test_for(vm_type: &VMType, json_data: &[u8]) -> Vec<String> {
 		let mut substate = Substate::new();
 		let mut tracer = NoopTracer;
 		let mut vm_tracer = NoopVMTracer;
-		let mut output = vec![];
 		let vm_factory = state.vm_factory();
+		let origin_info = OriginInfo::from(&params);
 
 		// execute
 		let (res, callcreates) = {
+			let schedule = machine.schedule(info.number);
 			let mut ex = try_fail!(TestExt::new(
 				&mut state,
 				&info,
 				&machine,
+				&schedule,
 				0,
-				OriginInfo::from(&params),
+				&origin_info,
 				&mut substate,
-				OutputPolicy::Return(BytesRef::Flexible(&mut output), None),
+				OutputPolicy::Return,
 				params.address.clone(),
 				&mut tracer,
 				&mut vm_tracer,
 			));
-			let mut evm = vm_factory.create(params.gas);
-			let res = evm.exec(params, &mut ex);
+			let evm = vm_factory.create(params, &schedule, 0).expect("Current tests are all of version 0; factory always return Some; qed");
+			let res = evm.exec(&mut ex).ok().expect("TestExt never trap; resume error never happens; qed");
 			// a return in finalize will not alter callcreates
 			let callcreates = ex.callcreates.clone();
 			(res.finalize(ex), callcreates)
+		};
+
+		let output = match &res {
+			Ok(res) => res.return_data.to_vec(),
+			Err(_) => Vec::new(),
 		};
 
 		let log_hash = {
@@ -285,19 +333,19 @@ fn do_json_test_for(vm_type: &VMType, json_data: &[u8]) -> Vec<String> {
 
 				for (address, account) in vm.post_state.unwrap().into_iter() {
 					let address = address.into();
-					let code: Vec<u8> = account.code.into();
+					let code: Vec<u8> = account.code.expect("code is missing from json; test should have code").into();
 					let found_code = try_fail!(state.code(&address));
 					let found_balance = try_fail!(state.balance(&address));
 					let found_nonce = try_fail!(state.nonce(&address));
 
 					fail_unless(found_code.as_ref().map_or_else(|| code.is_empty(), |c| &**c == &code), "code is incorrect");
-					fail_unless(found_balance == account.balance.into(), "balance is incorrect");
-					fail_unless(found_nonce == account.nonce.into(), "nonce is incorrect");
-					for (k, v) in account.storage {
+					fail_unless(account.balance.as_ref().map_or(false, |b| b.0 == found_balance), "balance is incorrect");
+					fail_unless(account.nonce.as_ref().map_or(false, |n| n.0 == found_nonce), "nonce is incorrect");
+					for (k, v) in account.storage.expect("test should have storage") {
 						let key: U256 = k.into();
 						let value: U256 = v.into();
-						let found_storage = try_fail!(state.storage_at(&address, &From::from(key)));
-						fail_unless(found_storage == From::from(value), "storage is incorrect");
+						let found_storage = try_fail!(state.storage_at(&address, &BigEndianHash::from_uint(&key)));
+						fail_unless(found_storage == BigEndianHash::from_uint(&value), "storage is incorrect");
 					}
 				}
 
@@ -305,10 +353,12 @@ fn do_json_test_for(vm_type: &VMType, json_data: &[u8]) -> Vec<String> {
 				fail_unless(Some(callcreates) == calls, "callcreates does not match");
 			}
 		};
+
+		start_stop_hook(&format!("{}", name), HookType::OnStop);
 	}
 
 	for f in &failed {
-		println!("FAILED: {:?}", f);
+		error!("FAILED: {:?}", f);
 	}
 
 	failed

@@ -1,29 +1,28 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Environment information for transaction execution.
 
 use std::cmp;
 use std::sync::Arc;
 use hash::keccak;
-use bigint::hash::H256;
-use bigint::prelude::U256;
-use util::Address;
-use types::BlockNumber;
+use ethereum_types::{U256, H256, Address};
 use ethjson;
+
+type BlockNumber = u64;
 
 /// Simple vector of hashes, should be at most 256 items large, can be smaller if being used
 /// for a block whose number is less than 257.
@@ -52,7 +51,7 @@ impl Default for EnvInfo {
 	fn default() -> Self {
 		EnvInfo {
 			number: 0,
-			author: Address::default(),
+			author: Address::zero(),
 			timestamp: 0,
 			difficulty: 0.into(),
 			gas_limit: 0.into(),
@@ -66,7 +65,7 @@ impl From<ethjson::vm::Env> for EnvInfo {
 	fn from(e: ethjson::vm::Env) -> Self {
 		let number = e.number.into();
 		EnvInfo {
-			number: number,
+			number,
 			author: e.author.into(),
 			difficulty: e.difficulty.into(),
 			gas_limit: e.gas_limit.into(),
@@ -81,8 +80,7 @@ impl From<ethjson::vm::Env> for EnvInfo {
 mod tests {
 	use std::str::FromStr;
 	use super::*;
-	use bigint::prelude::U256;
-	use util::Address;
+	use ethereum_types::{U256, Address};
 	use ethjson;
 
 	#[test]

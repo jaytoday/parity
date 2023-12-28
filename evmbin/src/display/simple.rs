@@ -1,37 +1,44 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Simple VM output.
+//! Log EVM instruction output data traces from a simple formatting informant.
 
-use ethcore::trace;
-use bytes::ToPretty;
+use trace;
+use parity_bytes::ToPretty;
 
-use display;
-use info as vm;
+use crate::{
+	display,
+	info as vm,
+};
 
 /// Simple formatting informant.
 #[derive(Default)]
 pub struct Informant;
 
 impl vm::Informant for Informant {
-	fn before_test(&self, name: &str, action: &str) {
+
+	type Sink = ();
+
+	fn before_test(&mut self, name: &str, action: &str) {
 		println!("Test: {} ({})", name, action);
 	}
 
-	fn finish(result: Result<vm::Success, vm::Failure>) {
+	fn clone_sink(&self) -> Self::Sink { () }
+
+	fn finish(result: vm::RunResult<Self::Output>, _sink: &mut Self::Sink) {
 		match result {
 			Ok(success) => {
 				println!("Output: 0x{}", success.output.to_hex());
@@ -47,7 +54,9 @@ impl vm::Informant for Informant {
 }
 
 impl trace::VMTracer for Informant {
-	fn prepare_subtrace(&self, _code: &[u8]) -> Self where Self: Sized { Default::default() }
-	fn done_subtrace(&mut self, _sub: Self) {}
-	fn drain(self) -> Option<trace::VMTrace> { None }
+	type Output = ();
+
+	fn prepare_subtrace(&mut self, _code: &[u8]) { Default::default() }
+	fn done_subtrace(&mut self) {}
+	fn drain(self) -> Option<()> { None }
 }

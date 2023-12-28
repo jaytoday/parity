@@ -1,15 +1,22 @@
 [package]
-description = "Ethcore IO library"
-homepage = "http://parity.io"
-license = "GPL-3.0"
 name = "ethcore-io"
-version = "1.8.0"
+description = "Ethcore IO library"
+version = "1.12.0"
+repository = "https://github.com/openethereum/openethereum"
+license = "GPL-3.0"
 authors = ["Parity Technologies <admin@parity.io>"]
+edition = "2018"
 
 [dependencies]
-mio = "0.6.8"
-crossbeam = "0.2"
-parking_lot = "0.4"
-log = "0.3"
-slab = "0.2"
+fnv = "1.0"
+mio = { version = "0.6.19", optional = true }
+crossbeam-deque = "0.7.3"
+parking_lot = "0.10.0"
+log = "0.4"
+slab = "0.4.2"
+num_cpus = "1.8"
+timer = "0.2"
+time = "0.1"
+tokio = "0.1"
+futures = "0.1"
 

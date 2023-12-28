@@ -1,18 +1,18 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Statistical functions and helpers.
 
@@ -46,6 +46,18 @@ impl<T> Deref for Corpus<T> {
 }
 
 impl<T: Ord> Corpus<T> {
+	/// Get given percentile (approximated).
+	pub fn percentile(&self, val: usize) -> Option<&T> {
+		let len = self.0.len();
+		let x = val * len / 100;
+		let x = ::std::cmp::min(x, len);
+		if x == 0 {
+			return None;
+		}
+
+		self.0.get(x - 1)
+	}
+
 	/// Get the median element, if it exists.
 	pub fn median(&self) -> Option<&T> {
 		self.0.get(self.0.len() / 2)
@@ -88,9 +100,9 @@ impl<T: Ord + Copy + ::std::fmt::Display> Histogram<T>
 {
 	// Histogram of a sorted corpus if it at least spans the buckets. Bounds are left closed.
 	fn create(corpus: &[T], bucket_number: usize) -> Option<Histogram<T>> {
-		if corpus.len() < 1 { return None; }
-		let corpus_end = corpus.last().expect("there is at least 1 element; qed").clone();
-		let corpus_start = corpus.first().expect("there is at least 1 element; qed").clone();
+		if corpus.is_empty() { return None; }
+		let corpus_end = *corpus.last().expect("there is at least 1 element; qed");
+		let corpus_start = *corpus.first().expect("there is at least 1 element; qed");
 		trace!(target: "stats", "Computing histogram from {} to {} with {} buckets.", corpus_start, corpus_end, bucket_number);
 		// Bucket needs to be at least 1 wide.
 		let bucket_size = {
@@ -114,14 +126,25 @@ impl<T: Ord + Copy + ::std::fmt::Display> Histogram<T>
 			bucket_bounds[bucket + 1] = bucket_end;
 			bucket_end = bucket_end + bucket_size;
 		}
-		Some(Histogram { bucket_bounds: bucket_bounds, counts: counts })
+		Some(Histogram { bucket_bounds, counts })
 	}
 }
 
-
 #[cfg(test)]
 mod tests {
-	use super::Histogram;
+	use super::*;
+
+	#[test]
+	fn check_corpus() {
+		let corpus = Corpus::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+		assert_eq!(corpus.percentile(0), None);
+		assert_eq!(corpus.percentile(1), None);
+		assert_eq!(corpus.percentile(101), Some(&10));
+		assert_eq!(corpus.percentile(100), Some(&10));
+		assert_eq!(corpus.percentile(50), Some(&5));
+		assert_eq!(corpus.percentile(60), Some(&6));
+		assert_eq!(corpus.median(), Some(&6));
+	}
 
 	#[test]
 	fn check_histogram() {

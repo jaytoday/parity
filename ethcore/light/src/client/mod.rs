@@ -1,49 +1,54 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Light client implementation. Stores data from light sync
 
 use std::sync::{Weak, Arc};
 
-use ethcore::block_status::BlockStatus;
-use ethcore::client::{ClientReport, EnvInfo};
-use ethcore::engines::{epoch, EthEngine, EpochChange, EpochTransition, Proof};
-use ethcore::machine::EthereumMachine;
-use ethcore::error::BlockImportError;
-use ethcore::ids::BlockId;
-use ethcore::header::{BlockNumber, Header};
-use ethcore::verification::queue::{self, HeaderQueue};
-use ethcore::blockchain_info::BlockChainInfo;
-use ethcore::spec::Spec;
-use ethcore::service::ClientIoMessage;
-use ethcore::encoded;
+use engine::{Engine, EpochChange, Proof};
+use verification::queue::{self, HeaderQueue};
+use spec::{Spec, SpecHardcodedSync};
 use io::IoChannel;
 use parking_lot::{Mutex, RwLock};
-use bigint::prelude::U256;
-use bigint::hash::H256;
+use ethereum_types::{H256, U256};
 use futures::{IntoFuture, Future};
-
-use kvdb::{KeyValueDB, CompactionProfile};
+use common_types::{
+	BlockNumber,
+	block_status::BlockStatus,
+	blockchain_info::BlockChainInfo,
+	client_types::ClientReport,
+	encoded,
+	engines::epoch::{Transition as EpochTransition, PendingTransition},
+	errors::EthcoreError as Error,
+	errors::EthcoreResult,
+	header::Header,
+	ids::BlockId,
+	io_message::ClientIoMessage,
+	verification::VerificationQueueInfo as BlockQueueInfo,
+};
+use kvdb::KeyValueDB;
+use vm::EnvInfo;
 
 use self::fetch::ChainDataFetcher;
-use self::header_chain::{AncestryIter, HeaderChain};
+use self::header_chain::{AncestryIter, HeaderChain, HardcodedSync};
 
 use cache::Cache;
 
 pub use self::service::Service;
+use client_traits::ForceUpdateSealing;
 
 mod header_chain;
 mod service;
@@ -56,29 +61,23 @@ pub struct Config {
 	/// Verification queue config.
 	pub queue: queue::Config,
 	/// Chain column in database.
-	pub chain_column: Option<u32>,
-	/// Database cache size. `None` => rocksdb default.
-	pub db_cache_size: Option<usize>,
-	/// State db compaction profile
-	pub db_compaction: CompactionProfile,
-	/// Should db have WAL enabled?
-	pub db_wal: bool,
+	pub chain_column: u32,
 	/// Should it do full verification of blocks?
 	pub verify_full: bool,
 	/// Should it check the seal of blocks?
 	pub check_seal: bool,
+	/// Disable hardcoded sync.
+	pub no_hardcoded_sync: bool,
 }
 
 impl Default for Config {
 	fn default() -> Config {
 		Config {
 			queue: Default::default(),
-			chain_column: None,
-			db_cache_size: None,
-			db_compaction: CompactionProfile::default(),
-			db_wal: true,
+			chain_column: 0,
 			verify_full: true,
 			check_seal: true,
+			no_hardcoded_sync: false,
 		}
 	}
 }
@@ -86,17 +85,20 @@ impl Default for Config {
 /// Trait for interacting with the header chain abstractly.
 pub trait LightChainClient: Send + Sync {
 	/// Adds a new `LightChainNotify` listener.
-	fn add_listener(&self, listener: Weak<LightChainNotify>);
+	fn add_listener(&self, listener: Weak<dyn LightChainNotify>);
 
 	/// Get chain info.
 	fn chain_info(&self) -> BlockChainInfo;
 
 	/// Queue header to be verified. Required that all headers queued have their
 	/// parent queued prior.
-	fn queue_header(&self, header: Header) -> Result<H256, BlockImportError>;
+	fn queue_header(&self, header: Header) -> EthcoreResult<H256>;
 
 	/// Attempt to get a block hash by block id.
 	fn block_hash(&self, id: BlockId) -> Option<H256>;
+
+	/// Get block queue information.
+	fn queue_info(&self) -> BlockQueueInfo;
 
 	/// Attempt to get block header by block id.
 	fn block_header(&self, id: BlockId) -> Option<encoded::Header>;
@@ -108,7 +110,7 @@ pub trait LightChainClient: Send + Sync {
 	fn score(&self, id: BlockId) -> Option<U256>;
 
 	/// Get an iterator over a block and its ancestry.
-	fn ancestry_iter<'a>(&'a self, start: BlockId) -> Box<Iterator<Item=encoded::Header> + 'a>;
+	fn ancestry_iter<'a>(&'a self, start: BlockId) -> Box<dyn Iterator<Item=encoded::Header> + 'a>;
 
 	/// Get the signing chain ID.
 	fn signing_chain_id(&self) -> Option<u64>;
@@ -118,10 +120,13 @@ pub trait LightChainClient: Send + Sync {
 	fn env_info(&self, id: BlockId) -> Option<EnvInfo>;
 
 	/// Get a handle to the consensus engine.
-	fn engine(&self) -> &Arc<EthEngine>;
+	fn engine(&self) -> &Arc<dyn Engine>;
 
 	/// Query whether a block is known.
 	fn is_known(&self, hash: &H256) -> bool;
+
+	/// Set the chain via a spec name.
+	fn set_spec_name(&self, new_spec_name: String) -> Result<(), ()>;
 
 	/// Clear the queue.
 	fn clear_queue(&self);
@@ -129,14 +134,8 @@ pub trait LightChainClient: Send + Sync {
 	/// Flush the queue.
 	fn flush_queue(&self);
 
-	/// Get queue info.
-	fn queue_info(&self) -> queue::QueueInfo;
-
 	/// Get the `i`th CHT root.
 	fn cht_root(&self, i: usize) -> Option<H256>;
-
-	/// Get the EIP-86 transition block number.
-	fn eip86_transition(&self) -> BlockNumber;
 
 	/// Get a report of import activity since the last call.
 	fn report(&self) -> ClientReport;
@@ -165,71 +164,63 @@ impl<T: LightChainClient> AsLightClient for T {
 
 /// Light client implementation.
 pub struct Client<T> {
-	queue: HeaderQueue,
-	engine: Arc<EthEngine>,
+	queue: HeaderQueue<()>,
+	engine: Arc<dyn Engine>,
 	chain: HeaderChain,
 	report: RwLock<ClientReport>,
 	import_lock: Mutex<()>,
-	db: Arc<KeyValueDB>,
-	listeners: RwLock<Vec<Weak<LightChainNotify>>>,
+	db: Arc<dyn KeyValueDB>,
+	listeners: RwLock<Vec<Weak<dyn LightChainNotify>>>,
 	fetcher: T,
 	verify_full: bool,
+	/// A closure to call when we want to restart the client
+	exit_handler: Mutex<Option<Box<dyn Fn(String) + 'static + Send>>>,
 }
 
 impl<T: ChainDataFetcher> Client<T> {
 	/// Create a new `Client`.
 	pub fn new(
 		config: Config,
-		db: Arc<KeyValueDB>,
-		chain_col: Option<u32>,
+		db: Arc<dyn KeyValueDB>,
+		chain_col: u32,
 		spec: &Spec,
 		fetcher: T,
-		io_channel: IoChannel<ClientIoMessage>,
+		io_channel: IoChannel<ClientIoMessage<()>>,
 		cache: Arc<Mutex<Cache>>
-	) -> Result<Self, String> {
-		Ok(Client {
+	) -> Result<Self, Error> {
+		Ok(Self {
 			queue: HeaderQueue::new(config.queue, spec.engine.clone(), io_channel, config.check_seal),
 			engine: spec.engine.clone(),
-			chain: HeaderChain::new(db.clone(), chain_col, &spec, cache)?,
+			chain: {
+				let hs_cfg = if config.no_hardcoded_sync { HardcodedSync::Deny } else { HardcodedSync::Allow };
+				HeaderChain::new(db.clone(), chain_col, &spec, cache, hs_cfg)?
+			},
 			report: RwLock::new(ClientReport::default()),
 			import_lock: Mutex::new(()),
-			db: db,
+			db,
 			listeners: RwLock::new(vec![]),
-			fetcher: fetcher,
+			fetcher,
 			verify_full: config.verify_full,
+			exit_handler: Mutex::new(None),
 		})
 	}
 
+	/// Generates the specifications for hardcoded sync. This is typically only called manually
+	/// from time to time by a Parity developer in order to update the chain specifications.
+	///
+	/// Returns `None` if we are at the genesis block.
+	pub fn read_hardcoded_sync(&self) -> Result<Option<SpecHardcodedSync>, Error> {
+		self.chain.read_hardcoded_sync()
+	}
+
 	/// Adds a new `LightChainNotify` listener.
-	pub fn add_listener(&self, listener: Weak<LightChainNotify>) {
+	pub fn add_listener(&self, listener: Weak<dyn LightChainNotify>) {
 		self.listeners.write().push(listener);
 	}
 
-	/// Create a new `Client` backed purely in-memory.
-	/// This will ignore all database options in the configuration.
-	pub fn in_memory(
-		config: Config,
-		spec: &Spec,
-		fetcher: T,
-		io_channel: IoChannel<ClientIoMessage>,
-		cache: Arc<Mutex<Cache>>
-	) -> Self {
-		let db = ::kvdb::in_memory(0);
-
-		Client::new(
-			config,
-			Arc::new(db),
-			None,
-			spec,
-			fetcher,
-			io_channel,
-			cache
-		).expect("New DB creation infallible; qed")
-	}
-
 	/// Import a header to the queue for additional verification.
-	pub fn import_header(&self, header: Header) -> Result<H256, BlockImportError> {
-		self.queue.import(header).map_err(Into::into)
+	pub fn import_header(&self, header: Header) -> EthcoreResult<H256> {
+		self.queue.import(header).map_err(|(e, _)| e)
 	}
 
 	/// Inquire about the status of a given header.
@@ -251,7 +242,7 @@ impl<T: ChainDataFetcher> Client<T> {
 		BlockChainInfo {
 			total_difficulty: best_td,
 			pending_total_difficulty: best_td + self.queue.total_difficulty(),
-			genesis_hash: genesis_hash,
+			genesis_hash,
 			best_block_hash: best_hdr.hash(),
 			best_block_number: best_hdr.number(),
 			best_block_timestamp: best_hdr.timestamp(),
@@ -263,7 +254,7 @@ impl<T: ChainDataFetcher> Client<T> {
 	}
 
 	/// Get the header queue info.
-	pub fn queue_info(&self) -> queue::QueueInfo {
+	pub fn queue_info(&self) -> BlockQueueInfo {
 		self.queue.queue_info()
 	}
 
@@ -335,14 +326,14 @@ impl<T: ChainDataFetcher> Client<T> {
 					The node may not be able to synchronize further.", e);
 			}
 
-			let epoch_proof =  self.engine.is_epoch_end(
+			let epoch_proof = self.engine.is_epoch_end_light(
 				&verified_header,
-				&|h| self.chain.block_header(BlockId::Hash(h)).map(|hdr| hdr.decode()),
+				&|h| self.chain.block_header(BlockId::Hash(h)).and_then(|hdr| hdr.decode().ok()),
 				&|h| self.chain.pending_transition(h),
 			);
 
 			let mut tx = self.db.transaction();
-			let pending = match self.chain.insert(&mut tx, verified_header, epoch_proof) {
+			let pending = match self.chain.insert(&mut tx, &verified_header, epoch_proof) {
 				Ok(pending) => {
 					good.push(hash);
 					self.report.write().blocks_imported += 1;
@@ -355,12 +346,8 @@ impl<T: ChainDataFetcher> Client<T> {
 				}
 			};
 
-			self.db.write_buffered(tx);
+			self.db.write(tx).expect("Low level database error writing a transaction. Some issue with the disk?");
 			self.chain.apply_pending(pending);
-		}
-
-		if let Err(e) = self.db.flush() {
-			panic!("Database flush failed: {}. Check disk health and space.", e);
 		}
 
 		self.queue.mark_as_bad(&bad);
@@ -376,13 +363,21 @@ impl<T: ChainDataFetcher> Client<T> {
 
 	/// Get blockchain mem usage in bytes.
 	pub fn chain_mem_used(&self) -> usize {
-		use heapsize::HeapSizeOf;
+		use parity_util_mem::MallocSizeOfExt;
 
-		self.chain.heap_size_of_children()
+		self.chain.malloc_size_of()
+	}
+
+	/// Set a closure to call when the client wants to be restarted.
+	///
+	/// The parameter passed to the callback is the name of the new chain spec to use after
+	/// the restart.
+	pub fn set_exit_handler<F>(&self, f: F) where F: Fn(String) + 'static + Send {
+		*self.exit_handler.lock() = Some(Box::new(f));
 	}
 
 	/// Get a handle to the verification engine.
-	pub fn engine(&self) -> &Arc<EthEngine> {
+	pub fn engine(&self) -> &Arc<dyn Engine> {
 		&self.engine
 	}
 
@@ -423,7 +418,7 @@ impl<T: ChainDataFetcher> Client<T> {
 		Arc::new(v)
 	}
 
-	fn notify<F: Fn(&LightChainNotify)>(&self, f: F) {
+	fn notify<F: Fn(&dyn LightChainNotify)>(&self, f: F) {
 		for listener in &*self.listeners.read() {
 			if let Some(listener) = listener.upgrade() {
 				f(&*listener)
@@ -445,7 +440,15 @@ impl<T: ChainDataFetcher> Client<T> {
 		};
 
 		// Verify Block Family
-		let verify_family_result = self.engine.verify_block_family(&verified_header, &parent_header.decode());
+
+		let verify_family_result = {
+			parent_header.decode()
+				.map_err(|dec_err| dec_err.into())
+				.and_then(|decoded| {
+					self.engine.verify_block_family(&verified_header, &decoded)
+				})
+
+		};
 		if let Err(e) = verify_family_result {
 			warn!(target: "client", "Stage 3 block verification failed for #{} ({})\nError: {:?}",
 				verified_header.number(), verified_header.hash(), e);
@@ -466,54 +469,28 @@ impl<T: ChainDataFetcher> Client<T> {
 		true
 	}
 
-	fn check_epoch_signal(&self, verified_header: &Header) -> Result<Option<Proof<EthereumMachine>>, T::Error> {
-		use ethcore::machine::{AuxiliaryRequest, AuxiliaryData};
-
-		let mut block: Option<Vec<u8>> = None;
+	fn check_epoch_signal(&self, verified_header: &Header) -> Result<Option<Proof>, T::Error> {
 		let mut receipts: Option<Vec<_>> = None;
 
 		loop {
 
-
-			let is_signal = {
-				let auxiliary = AuxiliaryData {
-					bytes: block.as_ref().map(|x| &x[..]),
-					receipts: receipts.as_ref().map(|x| &x[..]),
-				};
-
-				self.engine.signals_epoch_end(verified_header, auxiliary)
+			let is_transition = {
+				self.engine.signals_epoch_end(verified_header, receipts.as_ref().map(|x| &x[..]))
 			};
 
-			// check with any auxiliary data fetched so far
-			match is_signal {
+			// check if we need to fetch receipts
+			match is_transition {
 				EpochChange::No => return Ok(None),
 				EpochChange::Yes(proof) => return Ok(Some(proof)),
-				EpochChange::Unsure(unsure) => {
-					let (b, r) = match unsure {
-						AuxiliaryRequest::Body =>
-							(Some(self.fetcher.block_body(verified_header)), None),
-						AuxiliaryRequest::Receipts =>
-							(None, Some(self.fetcher.block_receipts(verified_header))),
-						AuxiliaryRequest::Both => (
-							Some(self.fetcher.block_body(verified_header)),
-							Some(self.fetcher.block_receipts(verified_header)),
-						),
-					};
-
-					if let Some(b) = b {
-						block = Some(b.into_future().wait()?.into_inner());
-					}
-
-					if let Some(r) = r {
-						receipts = Some(r.into_future().wait()?);
-					}
+				EpochChange::Unsure => {
+					receipts = Some(self.fetcher.block_receipts(verified_header).into_future().wait()?);
 				}
 			}
 		}
 	}
 
 	// attempts to fetch the epoch proof from the network until successful.
-	fn write_pending_proof(&self, header: &Header, proof: Proof<EthereumMachine>) -> Result<(), T::Error> {
+	fn write_pending_proof(&self, header: &Header, proof: Proof) -> Result<(), T::Error> {
 		let proof = match proof {
 			Proof::Known(known) => known,
 			Proof::WithState(state_dependent) => {
@@ -526,22 +503,27 @@ impl<T: ChainDataFetcher> Client<T> {
 		};
 
 		let mut batch = self.db.transaction();
-		self.chain.insert_pending_transition(&mut batch, header.hash(), epoch::PendingTransition {
-			proof: proof,
+		self.chain.insert_pending_transition(&mut batch, header.hash(), &PendingTransition {
+			proof,
 		});
-		self.db.write_buffered(batch);
+		self.db.write(batch).expect("Low level database error writing a transaction. Some issue with the disk?");
 		Ok(())
 	}
 }
 
+
 impl<T: ChainDataFetcher> LightChainClient for Client<T> {
-	fn add_listener(&self, listener: Weak<LightChainNotify>) {
+	fn add_listener(&self, listener: Weak<dyn LightChainNotify>) {
 		Client::add_listener(self, listener)
 	}
 
 	fn chain_info(&self) -> BlockChainInfo { Client::chain_info(self) }
 
-	fn queue_header(&self, header: Header) -> Result<H256, BlockImportError> {
+	fn queue_info(&self) -> BlockQueueInfo {
+		self.queue.queue_info()
+	}
+
+	fn queue_header(&self, header: Header) -> EthcoreResult<H256> {
 		self.import_header(header)
 	}
 
@@ -561,7 +543,7 @@ impl<T: ChainDataFetcher> LightChainClient for Client<T> {
 		Client::score(self, id)
 	}
 
-	fn ancestry_iter<'a>(&'a self, start: BlockId) -> Box<Iterator<Item=encoded::Header> + 'a> {
+	fn ancestry_iter<'a>(&'a self, start: BlockId) -> Box<dyn Iterator<Item=encoded::Header> + 'a> {
 		Box::new(Client::ancestry_iter(self, start))
 	}
 
@@ -573,8 +555,19 @@ impl<T: ChainDataFetcher> LightChainClient for Client<T> {
 		Client::env_info(self, id)
 	}
 
-	fn engine(&self) -> &Arc<EthEngine> {
+	fn engine(&self) -> &Arc<dyn Engine> {
 		Client::engine(self)
+	}
+
+	fn set_spec_name(&self, new_spec_name: String) -> Result<(), ()> {
+		trace!(target: "mode", "Client::set_spec_name({:?})", new_spec_name);
+		if let Some(ref h) = *self.exit_handler.lock() {
+			(*h)(new_spec_name);
+			Ok(())
+		} else {
+			warn!("Not hypervised; cannot change chain.");
+			Err(())
+		}
 	}
 
 	fn is_known(&self, hash: &H256) -> bool {
@@ -589,16 +582,8 @@ impl<T: ChainDataFetcher> LightChainClient for Client<T> {
 		Client::flush_queue(self);
 	}
 
-	fn queue_info(&self) -> queue::QueueInfo {
-		self.queue.queue_info()
-	}
-
 	fn cht_root(&self, i: usize) -> Option<H256> {
 		Client::cht_root(self, i)
-	}
-
-	fn eip86_transition(&self) -> BlockNumber {
-		self.engine().params().eip86_transition
 	}
 
 	fn report(&self) -> ClientReport {
@@ -606,8 +591,14 @@ impl<T: ChainDataFetcher> LightChainClient for Client<T> {
 	}
 }
 
-impl<T: ChainDataFetcher> ::ethcore::client::EngineClient for Client<T> {
-	fn update_sealing(&self) { }
+impl<T: ChainDataFetcher> client_traits::ChainInfo for Client<T> {
+	fn chain_info(&self) -> BlockChainInfo {
+		Client::chain_info(self)
+	}
+}
+
+impl<T: ChainDataFetcher> client_traits::EngineClient for Client<T> {
+	fn update_sealing(&self, _force: ForceUpdateSealing) {}
 	fn submit_seal(&self, _block_hash: H256, _seal: Vec<Vec<u8>>) { }
 	fn broadcast_consensus_message(&self, _message: Vec<u8>) { }
 
@@ -615,19 +606,21 @@ impl<T: ChainDataFetcher> ::ethcore::client::EngineClient for Client<T> {
 		self.chain.epoch_transition_for(parent_hash).map(|(hdr, proof)| EpochTransition {
 			block_hash: hdr.hash(),
 			block_number: hdr.number(),
-			proof: proof,
+			proof,
 		})
 	}
 
-	fn chain_info(&self) -> BlockChainInfo {
-		Client::chain_info(self)
-	}
-
-	fn as_full_client(&self) -> Option<&::ethcore::client::BlockChainClient> {
+	fn as_full_client(&self) -> Option<&dyn (client_traits::BlockChainClient)> {
 		None
 	}
 
 	fn block_number(&self, id: BlockId) -> Option<BlockNumber> {
 		self.block_header(id).map(|hdr| hdr.number())
 	}
+
+	fn block_header(&self, id: BlockId) -> Option<encoded::Header> {
+		Client::block_header(self, id)
+	}
 }
+
+impl<T> client_traits::Tick for Client<T> {}

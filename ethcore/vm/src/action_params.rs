@@ -1,28 +1,26 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Evm input params.
-use bigint::prelude::U256;
-use bigint::hash::{H256};
-use util::Address;
+use ethereum_types::{U256, H256, Address};
 use bytes::Bytes;
 use hash::{keccak, KECCAK_EMPTY};
 use ethjson;
 
-use call_type::CallType;
+use action_type::ActionType;
 
 use std::sync::Arc;
 
@@ -33,6 +31,15 @@ pub enum ActionValue {
 	Transfer(U256),
 	/// Apparent value for transaction (not transfered)
 	Apparent(U256)
+}
+
+/// Type of the way parameters encoded
+#[derive(Clone, Debug)]
+pub enum ParamsType {
+	/// Parameters are included in code
+	Embedded,
+	/// Parameters are passed in data section
+	Separate,
 }
 
 impl ActionValue {
@@ -77,28 +84,33 @@ pub struct ActionParams {
 	pub value: ActionValue,
 	/// Code being executed.
 	pub code: Option<Arc<Bytes>>,
+	/// Code version being executed.
+	pub code_version: U256,
 	/// Input data.
 	pub data: Option<Bytes>,
-	/// Type of call
-	pub call_type: CallType,
-
+	/// Type of action (e.g. CALL, DELEGATECALL, CREATE, etc.)
+	pub action_type: ActionType,
+	/// Param types encoding
+	pub params_type: ParamsType,
 }
 
 impl Default for ActionParams {
 	/// Returns default ActionParams initialized with zeros
 	fn default() -> ActionParams {
 		ActionParams {
-			code_address: Address::new(),
+			code_address: Address::zero(),
 			code_hash: Some(KECCAK_EMPTY),
-			address: Address::new(),
-			sender: Address::new(),
-			origin: Address::new(),
+			address: Address::zero(),
+			sender: Address::zero(),
+			origin: Address::zero(),
 			gas: U256::zero(),
 			gas_price: U256::zero(),
 			value: ActionValue::Transfer(U256::zero()),
 			code: None,
+			code_version: U256::zero(),
 			data: None,
-			call_type: CallType::None,
+			action_type: ActionType::Create,
+			params_type: ParamsType::Separate,
 		}
 	}
 }
@@ -107,17 +119,19 @@ impl From<ethjson::vm::Transaction> for ActionParams {
 	fn from(t: ethjson::vm::Transaction) -> Self {
 		let address: Address = t.address.into();
 		ActionParams {
-			code_address: Address::new(),
+			code_address: Address::zero(),
 			code_hash: Some(keccak(&*t.code)),
 			address: address,
 			sender: t.sender.into(),
 			origin: t.origin.into(),
 			code: Some(Arc::new(t.code.into())),
+			code_version: t.code_version.into(),
 			data: Some(t.data.into()),
 			gas: t.gas.into(),
 			gas_price: t.gas_price.into(),
 			value: ActionValue::Transfer(t.value.into()),
-			call_type: match address.is_zero() { true => CallType::None, false => CallType::Call },	// TODO @debris is this correct?
+			action_type: ActionType::Call,
+			params_type: ParamsType::Separate,
 		}
 	}
 }

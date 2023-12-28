@@ -1,23 +1,37 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! VM errors module
 
-use trie;
+use ::{ResumeCall, ResumeCreate};
+use ethereum_types::Address;
+use action_params::ActionParams;
 use std::fmt;
+use ethtrie;
+
+#[derive(Debug)]
+pub enum TrapKind {
+	Call(ActionParams),
+	Create(ActionParams, Address),
+}
+
+pub enum TrapError<Call, Create> {
+	Call(ActionParams, Call),
+	Create(ActionParams, Address, Create),
+}
 
 /// VM errors.
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +71,22 @@ pub enum Error {
 		/// What was the stack limit
 		limit: usize
 	},
+	/// `SubStackUnderflow` when there is not enough stack elements to execute a subroutine return
+	SubStackUnderflow {
+		/// How many stack elements was requested by instruction
+		wanted: usize,
+		/// How many elements were on stack
+		on_stack: usize
+	},
+	/// When execution would exceed defined subroutine Stack Limit
+	OutOfSubStack {
+		/// How many stack elements instruction wanted to pop
+		wanted: usize,
+		/// What was the stack limit
+		limit: usize
+	},
+	/// When the code walks into a subroutine, that is not allowed
+	InvalidSubEntry,
 	/// Built-in contract failed on given input
 	BuiltIn(&'static str),
 	/// When execution tries to modify the state in static context
@@ -71,28 +101,30 @@ pub enum Error {
 	Reverted,
 }
 
-
-impl From<Box<trie::TrieError>> for Error {
-	fn from(err: Box<trie::TrieError>) -> Self {
+impl From<Box<ethtrie::TrieError>> for Error {
+	fn from(err: Box<ethtrie::TrieError>) -> Self {
 		Error::Internal(format!("Internal error: {}", err))
 	}
 }
 
-// impl From<wasm::RuntimeError> for Error {
-// 	fn from(err: wasm::RuntimeError) -> Self {
-// 		Error::Wasm(format!("Runtime error: {:?}", err))
-// 	}
-// }
+impl From<ethtrie::TrieError> for Error {
+	fn from(err: ethtrie::TrieError) -> Self {
+		Error::Internal(format!("Internal error: {}", err))
+	}
+}
 
 impl fmt::Display for Error {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		use self::Error::*;
 		match *self {
 			OutOfGas => write!(f, "Out of gas"),
-			BadJumpDestination { destination } => write!(f, "Bad jump destination {:x}", destination),
+			BadJumpDestination { destination } => write!(f, "Bad jump destination {:x} (trimmed to usize)", destination),
 			BadInstruction { instruction } => write!(f, "Bad instruction {:x}",  instruction),
 			StackUnderflow { instruction, wanted, on_stack } => write!(f, "Stack underflow {} {}/{}", instruction, wanted, on_stack),
 			OutOfStack { instruction, wanted, limit } => write!(f, "Out of stack {} {}/{}", instruction, wanted, limit),
+			SubStackUnderflow { wanted, on_stack } => write!(f, "Subroutine stack underflow {}/{}", wanted, on_stack),
+			OutOfSubStack { wanted, limit } => write!(f, "Out of subroutine stack {}/{}", wanted, limit),
+			InvalidSubEntry => write!(f,"Invalid subroutine entry"),
 			BuiltIn(name) => write!(f, "Built-in failed: {}", name),
 			Internal(ref msg) => write!(f, "Internal error: {}", msg),
 			MutableCallInStaticContext => write!(f, "Mutable call in static context"),
@@ -104,3 +136,7 @@ impl fmt::Display for Error {
 }
 
 pub type Result<T> = ::std::result::Result<T, Error>;
+pub type TrapResult<T, Call, Create> = ::std::result::Result<Result<T>, TrapError<Call, Create>>;
+
+pub type ExecTrapResult<T> = TrapResult<T, Box<dyn ResumeCall>, Box<dyn ResumeCreate>>;
+pub type ExecTrapError = TrapError<Box<dyn ResumeCall>, Box<dyn ResumeCreate>>;
